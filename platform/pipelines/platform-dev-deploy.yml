@@ -1,0 +1,98 @@
+# Manual DEV Kafka deployment preview. PLAN ONLY; no Terraform Apply.
+name: confluent-platform-dev-preview-$(Date:yyyyMMdd)$(Rev:.r)
+trigger: none
+pr: none
+
+pool:
+  vmImage: ubuntu-24.04
+
+variables:
+  terraformVersion: '1.17.1'
+  azureServiceConnection: azure-confluent-service-connection
+  keyVaultName: kv-confluent-example
+
+stages:
+  - stage: DevKafkaPreview
+    displayName: Preview DEV Kafka cluster creation
+    jobs:
+      - job: TerraformPlan
+        displayName: Plan and enforce DEV-only creation
+        steps:
+          - checkout: self
+          - bash: |
+              set -euo pipefail
+              VERSION="$(terraformVersion)"
+              curl --fail --silent --show-error --location --retry 3 -o terraform.zip \
+                "https://releases.hashicorp.com/terraform/${VERSION}/terraform_${VERSION}_linux_amd64.zip"
+              unzip -q terraform.zip terraform
+              sudo install terraform /usr/local/bin/terraform
+              rm -f terraform.zip terraform
+              terraform fmt -check -recursive
+              terraform -chdir=environments/dev init -backend=false -input=false -lockfile=readonly
+              terraform -chdir=environments/dev validate -no-color
+            displayName: Install Terraform and validate DEV
+
+          - task: AzureKeyVault@2
+            displayName: Retrieve Confluent credentials
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              KeyVaultName: $(keyVaultName)
+              SecretsFilter: confluent-cloud-api-key,confluent-cloud-api-secret
+              RunAsPreJob: false
+
+          - task: AzureCLI@2
+            displayName: DEV Kafka plan and strict resource-change gate (no Apply)
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              workingDirectory: $(Build.SourcesDirectory)
+              inlineScript: |
+                set -euo pipefail
+                umask 077
+                PLAN_DIR="$(mktemp -d "$(Agent.TempDirectory)/dev-kafka-preview.XXXXXXXX")"
+                trap 'rm -rf -- "$PLAN_DIR"' EXIT
+
+                export ARM_USE_OIDC=true ARM_USE_AZUREAD=true ARM_USE_CLI=false
+                export ARM_CLIENT_ID="$servicePrincipalId"
+                export ARM_TENANT_ID="$tenantId"
+                export ARM_SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+                export ARM_OIDC_TOKEN="$idToken"
+                export TF_VAR_confluent_cloud_api_key="$CONFLUENT_CLOUD_API_KEY"
+                export TF_VAR_confluent_cloud_api_secret="$CONFLUENT_CLOUD_API_SECRET"
+
+                terraform -chdir=environments/dev init -input=false -lockfile=readonly \
+                  -backend-config=use_cli=false -backend-config=use_oidc=true \
+                  -backend-config=use_azuread_auth=true
+
+                terraform -chdir=environments/dev plan -input=false -no-color \
+                  -var=deploy_kafka_cluster=true \
+                  -var=deploy_service_accounts=false \
+                  -var=deploy_rbac=false \
+                  -out="$PLAN_DIR/tfplan"
+
+                terraform -chdir=environments/dev show -json "$PLAN_DIR/tfplan" > "$PLAN_DIR/plan.json"
+                export PLAN_JSON="$PLAN_DIR/plan.json"
+                python3 - <<'PYCODE'
+                import json, os, sys
+
+                expected = 'module.kafka_cluster[0].confluent_kafka_cluster.this'
+                with open(os.environ['PLAN_JSON'], encoding='utf-8') as stream:
+                    plan = json.load(stream)
+                changes = []
+                for resource in plan.get('resource_changes', []):
+                    actions = resource.get('change', {}).get('actions', [])
+                    if actions not in (['no-op'], ['read']):
+                        changes.append((resource.get('address'), actions))
+                for address, actions in changes:
+                    print(f'Resource change: {address}: {",".join(actions)}')
+                if changes != [(expected, ['create'])]:
+                    print('##vso[task.logissue type=error]Blocked: plan must contain exactly one Kafka cluster creation and no other changes.')
+                    sys.exit(1)
+                print('PASS: exactly one DEV Kafka cluster creation; no other resource changes.')
+                print('PLAN ONLY: no Terraform Apply executed; no plan artifact published.')
+                PYCODE
+            env:
+              CONFLUENT_CLOUD_API_KEY: $(confluent-cloud-api-key)
+              CONFLUENT_CLOUD_API_SECRET: $(confluent-cloud-api-secret)

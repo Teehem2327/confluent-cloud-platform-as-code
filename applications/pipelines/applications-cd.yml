@@ -1,0 +1,359 @@
+
+# Confluent Applications CD - Phase 18
+# Preflight checks, Terraform Plan reporting, and secure cleanup.
+# Terraform Apply is deliberately disabled.
+
+name: confluent-applications-cd-$(Date:yyyyMMdd)$(Rev:.r)
+
+trigger: none
+pr: none
+
+parameters:
+  - name: environment
+    displayName: Environment to validate
+    type: string
+    default: dev
+    values: [dev, test, prod]
+  - name: enableDeployment
+    displayName: Enable Application Deployment
+    type: boolean
+    default: false
+
+pool:
+  vmImage: ubuntu-24.04
+
+variables:
+  - ${{ if eq(parameters.environment, 'dev') }}:
+      - group: confluent-dev-platform-outputs
+      - group: confluent-dev-secrets
+
+  - name: azureServiceConnection
+    value: azure-confluent-service-connection
+
+  - name: terraformVersion
+    value: '1.17.1'
+
+stages:
+  - ${{ if eq(parameters.environment, 'dev') }}:
+      - stage: Preflight
+        displayName: Application Deployment Readiness
+
+        jobs:
+          - job: Validate
+            displayName: Verify Platform and Security Configuration
+
+            steps:
+              - checkout: self
+
+              - bash: |
+                  set -euo pipefail
+
+                  if [[ "$PLATFORM_ENVIRONMENT" != "dev" ]]; then
+                    echo "##vso[task.logissue type=error]Unexpected environment."
+                    exit 1
+                  fi
+
+                  echo "Platform environment verified: dev"
+                displayName: Verify Platform Environment
+                env:
+                  PLATFORM_ENVIRONMENT: $(PLATFORM_ENVIRONMENT)
+
+              - task: AzureCLI@2
+                displayName: Verify Azure Service Connection
+                inputs:
+                  azureSubscription: $(azureServiceConnection)
+                  scriptType: bash
+                  scriptLocation: inlineScript
+                  addSpnToEnvironment: true
+                  inlineScript: |
+                    set -euo pipefail
+
+                    az account show \
+                      --query "{subscription:name, tenant:tenantId}" \
+                      --output table
+
+                    if [[ -z "${servicePrincipalId:-}" || -z "${idToken:-}" ]]; then
+                      echo "##vso[task.logissue type=error]Workload identity credentials unavailable."
+                      exit 1
+                    fi
+
+                    echo "Azure workload identity federation is available."
+
+              - bash: |
+                  set -euo pipefail
+
+                  if [[ -z "${CONFLUENT_CLOUD_API_KEY:-}" ]]; then
+                    echo "##vso[task.logissue type=error]Cloud API key missing."
+                    exit 1
+                  fi
+
+                  if [[ -z "${CONFLUENT_CLOUD_API_SECRET:-}" ]]; then
+                    echo "##vso[task.logissue type=error]Cloud API secret missing."
+                    exit 1
+                  fi
+
+                  echo "Confluent Cloud credentials are available."
+                  echo "Secret values were not displayed."
+                displayName: Verify Key Vault Credentials
+                env:
+                  CONFLUENT_CLOUD_API_KEY: $(confluent-cloud-api-key)
+                  CONFLUENT_CLOUD_API_SECRET: $(confluent-cloud-api-secret)
+
+  - ${{ if eq(parameters.environment, 'dev') }}:
+      - stage: TerraformPlan
+        displayName: Applications Terraform Plan
+        dependsOn: Preflight
+        condition: succeeded()
+
+        jobs:
+          - job: Plan
+            displayName: Validate and Plan DEV Applications
+
+            steps:
+              - checkout: self
+
+              - bash: |
+                  set -euo pipefail
+
+                  VERSION="$(terraformVersion)"
+
+                  curl --fail --location --retry 3 \
+                    --output terraform.zip \
+                    "https://releases.hashicorp.com/terraform/${VERSION}/terraform_${VERSION}_linux_amd64.zip"
+
+                  unzip -o terraform.zip terraform
+
+                  sudo install terraform /usr/local/bin/terraform
+
+                  terraform version
+
+                  rm -f terraform.zip terraform
+                displayName: Install Terraform
+
+              - task: AzureCLI@2
+                displayName: Terraform Init Validate and Plan
+                inputs:
+                  azureSubscription: $(azureServiceConnection)
+                  scriptType: bash
+                  scriptLocation: inlineScript
+                  addSpnToEnvironment: true
+                  workingDirectory: $(Build.SourcesDirectory)
+                  inlineScript: |
+                    set -euo pipefail
+                    umask 077
+
+                    # Secure temporary directory for Terraform plan files.
+                    PLAN_DIR="$(mktemp -d "$(Agent.TempDirectory)/confluent-applications-plan.XXXXXXXX")"
+                    chmod 700 "$PLAN_DIR"
+
+                    # Always remove sensitive temporary files on exit.
+                    cleanup() {
+                      rm -rf -- "$PLAN_DIR"
+                    }
+
+                    trap cleanup EXIT
+
+                    PLAN_FILE="$PLAN_DIR/tfplan"
+                    PLAN_JSON="$PLAN_DIR/plan.json"
+                    export PLAN_JSON
+
+                    # Azure DevOps workload identity federation.
+                    export ARM_USE_OIDC=true
+                    export ARM_USE_AZUREAD=true
+                    export ARM_USE_CLI=false
+
+                    export ARM_CLIENT_ID="$servicePrincipalId"
+                    export ARM_TENANT_ID="$tenantId"
+                    export ARM_SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+                    export ARM_OIDC_TOKEN="$idToken"
+
+                    # Confluent credentials retrieved from Key Vault.
+                    export TF_VAR_confluent_cloud_api_key="$CONFLUENT_CLOUD_API_KEY"
+                    export TF_VAR_confluent_cloud_api_secret="$CONFLUENT_CLOUD_API_SECRET"
+
+                    # Keep application resource deployment disabled.
+                    export TF_VAR_deploy_application_resources=false
+
+                    echo "Initializing Applications Terraform backend..."
+
+                    terraform -chdir=environments/dev init \
+                      -input=false \
+                      -lockfile=readonly \
+                      -backend-config="use_cli=false" \
+                      -backend-config="use_oidc=true" \
+                      -backend-config="use_azuread_auth=true"
+
+                    echo "Checking Terraform formatting..."
+                    terraform fmt -check -recursive
+
+                    echo "Validating Terraform configuration..."
+                    terraform -chdir=environments/dev validate
+
+                    echo "Generating safe DEV Applications plan..."
+
+                    terraform -chdir=environments/dev plan \
+                      -input=false \
+                      -var="deploy_application_resources=false" \
+                      -out="$PLAN_FILE"
+
+                    echo "Inspecting Terraform resource changes..."
+
+                    terraform -chdir=environments/dev show \
+                      -json "$PLAN_FILE" > "$PLAN_JSON"
+
+                    python3 - <<'PY'
+                    import json
+                    import os
+                    import sys
+
+                    with open(os.environ["PLAN_JSON"], encoding="utf-8") as f:
+                        plan = json.load(f)
+
+                    changes = plan.get("resource_changes", [])
+                    counts = {
+                        "create": 0,
+                        "update": 0,
+                        "delete": 0,
+                        "replace": 0,
+                    }
+                    unexpected = []
+
+                    for resource in changes:
+                        actions = resource.get("change", {}).get("actions", [])
+
+                        if actions in (["no-op"], ["read"]):
+                            continue
+
+                        if "create" in actions and "delete" in actions:
+                            counts["replace"] += 1
+                        elif actions == ["create"]:
+                            counts["create"] += 1
+                        elif actions == ["delete"]:
+                            counts["delete"] += 1
+                        elif actions == ["update"]:
+                            counts["update"] += 1
+                        else:
+                            unexpected.append(resource.get("address", "unknown"))
+
+                    total = sum(counts.values())
+
+                    summary_lines = [
+                        "# Applications Terraform Plan Summary",
+                        "",
+                        "| Action | Count |",
+                        "|---|---:|",
+                        f"| Create | {counts['create']} |",
+                        f"| Update | {counts['update']} |",
+                        f"| Delete | {counts['delete']} |",
+                        f"| Replace | {counts['replace']} |",
+                        f"| **Total resource changes** | **{total}** |",
+                        f"| Unexpected actions | {len(unexpected)} |",
+                        "",
+                        "Deployment enabled: **No**",
+                        "",
+                        "Terraform Apply executed: **No**",
+                        "",
+                    ]
+
+                    summary_path = os.path.join(
+                        os.environ["AGENT_TEMPDIRECTORY"],
+                        "terraform-plan-summary.md"
+                    )
+
+                    with open(summary_path, "w", encoding="utf-8") as f:
+                        f.write("\n".join(summary_lines))
+
+                    print(f"Terraform resource changes: {total}")
+                    print(
+                        f"Creates: {counts['create']}, "
+                        f"Updates: {counts['update']}, "
+                        f"Deletes: {counts['delete']}, "
+                        f"Replacements: {counts['replace']}"
+                    )
+                    print(f"Unexpected actions: {len(unexpected)}")
+
+                    print(f"##vso[task.uploadsummary]{summary_path}")
+
+                    if total != 0 or unexpected:
+                        print(
+                            "##vso[task.logissue type=error]"
+                            "Infrastructure changes detected while deployment is disabled."
+                        )
+                        sys.exit(1)
+
+                    print("Safety gate passed: zero infrastructure resource changes.")
+                    PY
+
+                    echo "Terraform Plan safety checks completed."
+                    echo "Temporary plan files will be cleaned up automatically."
+                    echo "No Terraform Apply will be executed."
+
+                env:
+                  CONFLUENT_CLOUD_API_KEY: $(confluent-cloud-api-key)
+                  CONFLUENT_CLOUD_API_SECRET: $(confluent-cloud-api-secret)
+
+              - bash: |
+                  set -euo pipefail
+                  echo "Phase 18 security checks completed."
+                  echo "Terraform Plan and automated safety gate only."
+                  echo "Sensitive temporary plan files cleaned up."
+                  echo "Application resource deployment remains disabled."
+                  echo "No Terraform Apply executed."
+                displayName: Confirm Deployment Safety
+
+  # Deployment requests remain deliberately blocked.
+  - ${{ if and(eq(parameters.environment, 'dev'), eq(parameters.enableDeployment, true)) }}:
+      - stage: DeploymentBlocked
+        displayName: Deployment Blocked
+        dependsOn:
+          - Preflight
+          - TerraformPlan
+        condition: always()
+
+        jobs:
+          - job: Block
+            displayName: Prevent Unconfigured Deployment
+
+            steps:
+              - bash: |
+                  echo "##vso[task.logissue type=error]Application deployment is not enabled."
+                  echo "Kafka infrastructure and approval controls must be ready."
+                  exit 1
+                displayName: Block Deployment
+
+  # SAFE_ENVIRONMENT_APPROVAL_GATE_V1
+  # TEST/PROD have static validation and approval only; no credentials, remote state, plan, or Apply.
+  - ${{ if ne(parameters.environment, 'dev') }}:
+      - stage: StaticValidation
+        displayName: Validate ${{ parameters.environment }} configuration
+        jobs:
+          - job: ValidateFiles
+            pool:
+              vmImage: ubuntu-24.04
+            steps:
+              - checkout: self
+              - bash: |
+                  set -euo pipefail
+                  test -f environments/${{ parameters.environment }}/main.tf
+                  test -f environments/${{ parameters.environment }}/backend.tf
+                  test -f environments/${{ parameters.environment }}/providers.tf
+                  test -f environments/${{ parameters.environment }}/variables.tf
+                  echo 'Required environment files are present. No remote state contacted.'
+                displayName: Check configuration files
+      - stage: EnvironmentApproval
+        displayName: Approval gate for ${{ parameters.environment }} (no Apply)
+        dependsOn: StaticValidation
+        condition: succeeded()
+        jobs:
+          - deployment: ReviewEnvironment
+            displayName: Review ${{ parameters.environment }} configuration
+            environment: confluent-${{ parameters.environment }}
+            strategy:
+              runOnce:
+                deploy:
+                  steps:
+                    - bash: |
+                        set -euo pipefail
+                        echo 'Environment approval completed.'
+                        echo 'No remote Terraform plan or Apply executed.'
+                      displayName: Confirm approval-only gate

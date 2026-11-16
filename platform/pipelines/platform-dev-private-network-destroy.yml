@@ -1,0 +1,223 @@
+# Approval-gated DESTROY of the DEV private network (Azure Private Link, optional Enterprise cluster).
+# Removes only the private-network root; kafka-dev and the rest of DEV are untouched.
+# Preview stage: plans and checks the exact deletes; nothing is destroyed.
+# Destroy stage: only when enableDestroy is ticked AND confirm equals destroy-private-network;
+# it then waits at the confluent-dev approval check, re-plans, re-checks and destroys the saved plan.
+name: PLATFORM-DEV-PRIVATE-NETWORK-DESTROY-$(Date:yyyyMMdd)$(Rev:.r)
+trigger: none
+pr: none
+
+parameters:
+  - name: includeCluster
+    displayName: Include the Enterprise cluster (billed hourly)
+    type: boolean
+    default: false
+  - name: enableDestroy
+    displayName: DESTROY after approval (leave unticked to preview only)
+    type: boolean
+    default: false
+  - name: confirm
+    displayName: Type destroy-private-network to confirm
+    type: string
+    default: ''
+
+pool:
+  vmImage: ubuntu-24.04
+
+variables:
+  terraformVersion: '1.17.1'
+  azureServiceConnection: azure-confluent-service-connection
+  keyVaultName: kv-confluent-example
+
+stages:
+  - stage: Preview
+    displayName: Preview private network (nothing destroyed)
+    jobs:
+      - job: PlanOnly
+        steps:
+          - checkout: self
+          - bash: |
+              set -euo pipefail
+              VERSION="$(terraformVersion)"
+              curl --fail --silent --show-error --location --retry 3 -o terraform.zip \
+                "https://releases.hashicorp.com/terraform/${VERSION}/terraform_${VERSION}_linux_amd64.zip"
+              unzip -q terraform.zip terraform
+              sudo install terraform /usr/local/bin/terraform
+              rm -f terraform.zip terraform
+              terraform fmt -check -recursive
+              terraform -chdir=environments/dev-private-network init -backend=false -input=false -lockfile=readonly
+              terraform -chdir=environments/dev-private-network validate -no-color
+            displayName: Install and validate Terraform
+          - task: AzureKeyVault@2
+            displayName: Retrieve Confluent Cloud credentials
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              KeyVaultName: $(keyVaultName)
+              SecretsFilter: confluent-cloud-api-key,confluent-cloud-api-secret
+              RunAsPreJob: false
+          - task: AzureCLI@2
+            displayName: Plan and check the exact changes (nothing destroyed)
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              workingDirectory: $(Build.SourcesDirectory)
+              inlineScript: |
+                set -euo pipefail
+                umask 077
+                PLAN_DIR="$(mktemp -d "$(Agent.TempDirectory)/platform-dev-private-network-destroy.XXXXXXXX")"
+                trap 'rm -rf -- "$PLAN_DIR"' EXIT
+                export ARM_USE_OIDC=true ARM_USE_AZUREAD=true ARM_USE_CLI=false
+                export ARM_CLIENT_ID="$servicePrincipalId"
+                export ARM_TENANT_ID="$tenantId"
+                export ARM_SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+                export ARM_OIDC_TOKEN="$idToken"
+                export TF_VAR_azure_subscription_id="$ARM_SUBSCRIPTION_ID"
+                export TF_VAR_confluent_cloud_api_key="$CONFLUENT_CLOUD_API_KEY"
+                export TF_VAR_confluent_cloud_api_secret="$CONFLUENT_CLOUD_API_SECRET"
+                terraform -chdir=environments/dev-private-network init -input=false -lockfile=readonly \
+                  -backend-config=use_cli=false -backend-config=use_oidc=true -backend-config=use_azuread_auth=true
+                terraform -chdir=environments/dev-private-network plan -destroy -input=false -no-color -lock-timeout=5m \
+                  -var=deploy_private_networking=true \
+                  -var=deploy_private_cluster=${{ lower(parameters.includeCluster) }} \
+                  -out="$PLAN_DIR/tfplan"
+                terraform -chdir=environments/dev-private-network show -json "$PLAN_DIR/tfplan" > "$PLAN_DIR/plan.json"
+                export PLAN_JSON="$PLAN_DIR/plan.json"
+                export INCLUDE_CLUSTER="${{ lower(parameters.includeCluster) }}"
+                python3 - <<'PYCODE'
+                import json, os, sys
+                include_cluster = os.environ['INCLUDE_CLUSTER'] == 'true'
+                expected = {
+                    'confluent_gateway.dev[0]',
+                    'azurerm_virtual_network.private[0]',
+                    'azurerm_subnet.endpoint[0]',
+                    'azurerm_private_endpoint.confluent[0]',
+                    'confluent_access_point.dev[0]',
+                    'azurerm_private_dns_zone.confluent[0]',
+                    'azurerm_private_dns_zone_virtual_network_link.confluent[0]',
+                    'azurerm_private_dns_a_record.wildcard[0]',
+                }
+                if include_cluster:
+                    expected.add('confluent_kafka_cluster.private[0]')
+                with open(os.environ['PLAN_JSON'], encoding='utf-8') as f:
+                    plan = json.load(f)
+                changes = {}
+                for r in plan.get('resource_changes', []):
+                    actions = r.get('change', {}).get('actions', [])
+                    if actions not in (['no-op'], ['read']):
+                        changes[r['address']] = actions
+                for address, actions in sorted(changes.items()):
+                    print(f'Planned: {address}: {actions}')
+                print(f'Total planned: {len(changes)}')
+                want = ['delete']
+                ok = bool(changes) and set(changes) <= expected
+                if not ok or any(a != want for a in changes.values()):
+                    print('##vso[task.logissue type=error]Blocked: the plan is not exactly the expected deletes of the private-network root.')
+                    sys.exit(1)
+                print('PASS: only the expected deletes.')
+                PYCODE
+                echo 'Nothing executed in this stage.'
+            env:
+              CONFLUENT_CLOUD_API_KEY: $(confluent-cloud-api-key)
+              CONFLUENT_CLOUD_API_SECRET: $(confluent-cloud-api-secret)
+
+  - ${{ if and(eq(parameters.enableDestroy, true), eq(parameters.confirm, 'destroy-private-network')) }}:
+      - stage: Destroy
+        displayName: Approved DESTROY of the DEV private network
+        dependsOn: Preview
+        jobs:
+          - deployment: Run
+            displayName: Destroy the private network after approval
+            environment: confluent-dev
+            strategy:
+              runOnce:
+                deploy:
+                  steps:
+                    - checkout: self
+                    - bash: |
+                        set -euo pipefail
+                        VERSION="$(terraformVersion)"
+                        curl --fail --silent --show-error --location --retry 3 -o terraform.zip \
+                          "https://releases.hashicorp.com/terraform/${VERSION}/terraform_${VERSION}_linux_amd64.zip"
+                        unzip -q terraform.zip terraform
+                        sudo install terraform /usr/local/bin/terraform
+                        rm -f terraform.zip terraform
+                        terraform fmt -check -recursive
+                        terraform -chdir=environments/dev-private-network init -backend=false -input=false -lockfile=readonly
+                        terraform -chdir=environments/dev-private-network validate -no-color
+                      displayName: Install Terraform and validate
+                    - task: AzureKeyVault@2
+                      displayName: Retrieve Confluent Cloud credentials
+                      inputs:
+                        azureSubscription: $(azureServiceConnection)
+                        KeyVaultName: $(keyVaultName)
+                        SecretsFilter: confluent-cloud-api-key,confluent-cloud-api-secret
+                        RunAsPreJob: false
+                    - task: AzureCLI@2
+                      displayName: Re-check the plan and destroy
+                      inputs:
+                        azureSubscription: $(azureServiceConnection)
+                        scriptType: bash
+                        scriptLocation: inlineScript
+                        addSpnToEnvironment: true
+                        workingDirectory: $(Build.SourcesDirectory)
+                        inlineScript: |
+                          set -euo pipefail
+                          umask 077
+                          PLAN_DIR="$(mktemp -d "$(Agent.TempDirectory)/platform-dev-private-network-destroy.XXXXXXXX")"
+                          trap 'rm -rf -- "$PLAN_DIR"' EXIT
+                          export ARM_USE_OIDC=true ARM_USE_AZUREAD=true ARM_USE_CLI=false
+                          export ARM_CLIENT_ID="$servicePrincipalId"
+                          export ARM_TENANT_ID="$tenantId"
+                          export ARM_SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+                          export ARM_OIDC_TOKEN="$idToken"
+                          export TF_VAR_azure_subscription_id="$ARM_SUBSCRIPTION_ID"
+                          export TF_VAR_confluent_cloud_api_key="$CONFLUENT_CLOUD_API_KEY"
+                          export TF_VAR_confluent_cloud_api_secret="$CONFLUENT_CLOUD_API_SECRET"
+                          terraform -chdir=environments/dev-private-network init -input=false -lockfile=readonly \
+                            -backend-config=use_cli=false -backend-config=use_oidc=true -backend-config=use_azuread_auth=true
+                          terraform -chdir=environments/dev-private-network plan -destroy -input=false -no-color -lock-timeout=5m \
+                            -var=deploy_private_networking=true \
+                            -var=deploy_private_cluster=${{ lower(parameters.includeCluster) }} \
+                            -out="$PLAN_DIR/tfplan"
+                          terraform -chdir=environments/dev-private-network show -json "$PLAN_DIR/tfplan" > "$PLAN_DIR/plan.json"
+                          export PLAN_JSON="$PLAN_DIR/plan.json"
+                          export INCLUDE_CLUSTER="${{ lower(parameters.includeCluster) }}"
+                          python3 - <<'PYCODE'
+                          import json, os, sys
+                          include_cluster = os.environ['INCLUDE_CLUSTER'] == 'true'
+                          expected = {
+                              'confluent_gateway.dev[0]',
+                              'azurerm_virtual_network.private[0]',
+                              'azurerm_subnet.endpoint[0]',
+                              'azurerm_private_endpoint.confluent[0]',
+                              'confluent_access_point.dev[0]',
+                              'azurerm_private_dns_zone.confluent[0]',
+                              'azurerm_private_dns_zone_virtual_network_link.confluent[0]',
+                              'azurerm_private_dns_a_record.wildcard[0]',
+                          }
+                          if include_cluster:
+                              expected.add('confluent_kafka_cluster.private[0]')
+                          with open(os.environ['PLAN_JSON'], encoding='utf-8') as f:
+                              plan = json.load(f)
+                          changes = {}
+                          for r in plan.get('resource_changes', []):
+                              actions = r.get('change', {}).get('actions', [])
+                              if actions not in (['no-op'], ['read']):
+                                  changes[r['address']] = actions
+                          for address, actions in sorted(changes.items()):
+                              print(f'Planned: {address}: {actions}')
+                          print(f'Total planned: {len(changes)}')
+                          want = ['delete']
+                          ok = bool(changes) and set(changes) <= expected
+                          if not ok or any(a != want for a in changes.values()):
+                              print('##vso[task.logissue type=error]Blocked: the plan is not exactly the expected deletes of the private-network root.')
+                              sys.exit(1)
+                          print('PASS: only the expected deletes.')
+                          PYCODE
+                          terraform -chdir=environments/dev-private-network apply -input=false -no-color "$PLAN_DIR/tfplan"
+                          echo 'PASS: approved private-network destroy finished.'
+                      env:
+                        CONFLUENT_CLOUD_API_KEY: $(confluent-cloud-api-key)
+                        CONFLUENT_CLOUD_API_SECRET: $(confluent-cloud-api-secret)

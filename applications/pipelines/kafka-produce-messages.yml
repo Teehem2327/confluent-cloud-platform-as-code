@@ -1,0 +1,142 @@
+# Manual pipeline: sends sample order messages to <environment>.orders through the Confluent REST produce API.
+# DEV messages are Avro (wire format, schema id looked up from the registered dev.orders-value subject);
+# TEST and PROD have no schema, so they receive JSON. Cluster IDs and endpoints are discovered through the
+# Confluent Cloud API by environment name. It writes messages only and never changes Terraform-managed resources.
+name: kafka-produce-messages-${{ parameters.environment }}-$(Date:yyyyMMdd)$(Rev:.r)
+trigger: none
+pr: none
+
+parameters:
+  - name: environment
+    displayName: Environment to send messages to
+    type: string
+    default: test
+    values: [dev, test, prod]
+  - name: messageCount
+    displayName: Number of messages (1-200)
+    type: number
+    default: 50
+
+pool:
+  vmImage: ubuntu-24.04
+
+variables:
+  azureServiceConnection: azure-confluent-service-connection
+  keyVaultName: kv-confluent-example
+
+steps:
+  - task: AzureKeyVault@2
+    displayName: Retrieve credentials from Key Vault
+    inputs:
+      azureSubscription: $(azureServiceConnection)
+      KeyVaultName: $(keyVaultName)
+      ${{ if eq(parameters.environment, 'dev') }}:
+        SecretsFilter: confluent-cloud-api-key,confluent-cloud-api-secret,dev-application-kafka-api-key,dev-application-kafka-api-secret,dev-schema-registry-api-key,dev-schema-registry-api-secret
+      ${{ else }}:
+        SecretsFilter: confluent-cloud-api-key,confluent-cloud-api-secret,${{ parameters.environment }}-application-kafka-api-key,${{ parameters.environment }}-application-kafka-api-secret
+      RunAsPreJob: false
+  - bash: |
+      set -euo pipefail
+      python3 - <<'PYCODE'
+      import base64, json, os, struct, sys, time, urllib.error, urllib.request
+      from datetime import datetime, timezone
+
+      env = os.environ['TARGET_ENV']
+      count = int(float(os.environ['MESSAGE_COUNT']))
+      if not 1 <= count <= 200:
+          sys.exit('messageCount must be between 1 and 200')
+
+      def basic(key, secret):
+          return 'Basic ' + base64.b64encode(f'{key}:{secret}'.encode()).decode()
+
+      def call(url, auth, body=None, content_type='application/json'):
+          data = json.dumps(body).encode() if body is not None else None
+          req = urllib.request.Request(url, data=data, method='POST' if body is not None else 'GET',
+                                       headers={'Authorization': auth, 'Content-Type': content_type})
+          with urllib.request.urlopen(req, timeout=30) as resp:
+              return json.loads(resp.read().decode() or '{}')
+
+      cloud = basic(os.environ['CLOUD_KEY'], os.environ['CLOUD_SECRET'])
+      envs = call('https://api.confluent.cloud/org/v2/environments?page_size=100', cloud)['data']
+      env_id = next((e['id'] for e in envs if e['display_name'] == env), None)
+      if not env_id:
+          sys.exit(f'Environment {env} not found')
+      clusters = call(f'https://api.confluent.cloud/cmk/v2/clusters?environment={env_id}&page_size=100', cloud)['data']
+      cluster = next((c for c in clusters if c['spec']['display_name'] == f'kafka-{env}'), None)
+      if not cluster:
+          sys.exit(f'Cluster kafka-{env} not found')
+      cluster_id = cluster['id']
+      rest = cluster['spec']['http_endpoint']
+      print(f'Using {env} / {cluster_id}')
+
+      topic = f'{env}.orders'
+      url = f'{rest}/kafka/v3/clusters/{cluster_id}/topics/{topic}/records'
+      kafka_auth = basic(os.environ['APP_KEY'], os.environ['APP_SECRET'])
+
+      def zigzag(n):
+          n = (n << 1) ^ (n >> 63)
+          out = bytearray()
+          while True:
+              b = n & 0x7F
+              n >>= 7
+              if n:
+                  out.append(b | 0x80)
+              else:
+                  out.append(b)
+                  return bytes(out)
+
+      def avro_str(s):
+          b = s.encode()
+          return zigzag(len(b)) + b
+
+      schema_id = None
+      if env == 'dev':
+          srs = call(f'https://api.confluent.cloud/srcm/v3/clusters?environment={env_id}', cloud)['data']
+          sr = srs[0]['spec']['http_endpoint']
+          sr_auth = basic(os.environ['SR_KEY'], os.environ['SR_SECRET'])
+          schema_id = call(f'{sr}/subjects/dev.orders-value/versions/latest', sr_auth)['id']
+          print(f'Schema dev.orders-value id {schema_id}')
+
+      ok = failed = 0
+      first_error = ''
+      run = time.strftime('%Y%m%d%H%M%S')
+      for i in range(1, count + 1):
+          order_id = f'{env}-{run}-{i}'
+          amount = round(10 + (i * 7.3) % 90, 2)
+          now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+          if env == 'dev':
+              record = (avro_str(order_id) + avro_str(f'customer-{i % 10}') + struct.pack('<d', amount)
+                        + avro_str('CREATED') + avro_str(now))
+              payload = b'\x00' + struct.pack('>I', schema_id) + record
+              value = {'type': 'BINARY', 'data': base64.b64encode(payload).decode()}
+          else:
+              value = {'type': 'JSON', 'data': {'orderId': order_id, 'environment': env,
+                                                'amount': amount, 'currency': 'USD', 'status': 'CREATED'}}
+          body = {'key': {'type': 'STRING', 'data': f'order-{i % 10}'}, 'value': value}
+          try:
+              call(url, kafka_auth, body)
+              ok += 1
+          except urllib.error.HTTPError as e:
+              failed += 1
+              first_error = first_error or f'HTTP {e.code}: {e.read().decode()[:200]}'
+          except Exception as e:
+              failed += 1
+              first_error = first_error or type(e).__name__
+          time.sleep(0.2)
+      print(f'Topic {topic}: {ok} sent, {failed} failed.')
+      if failed:
+          print('##vso[task.logissue type=error]First error: ' + first_error)
+          sys.exit(1)
+      print('PASS: messages produced.')
+      PYCODE
+    displayName: Produce sample messages to ${{ parameters.environment }}.orders
+    env:
+      TARGET_ENV: ${{ parameters.environment }}
+      MESSAGE_COUNT: ${{ parameters.messageCount }}
+      CLOUD_KEY: $(confluent-cloud-api-key)
+      CLOUD_SECRET: $(confluent-cloud-api-secret)
+      APP_KEY: $(${{ parameters.environment }}-application-kafka-api-key)
+      APP_SECRET: $(${{ parameters.environment }}-application-kafka-api-secret)
+      ${{ if eq(parameters.environment, 'dev') }}:
+        SR_KEY: $(dev-schema-registry-api-key)
+        SR_SECRET: $(dev-schema-registry-api-secret)

@@ -1,0 +1,28 @@
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
+*.tfplan
+*.tfplan.*
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+crash.log
+crash.*.log
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+
+# Kafka monitoring collector
+monitoring/collector-checkpoints.json
+monitoring/collector-checkpoints.json.tmp
+monitoring/*.bak
+monitoring/__pycache__/
+
+# Local backup files
+*.bak

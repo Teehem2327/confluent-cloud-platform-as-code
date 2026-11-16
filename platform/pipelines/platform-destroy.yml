@@ -1,0 +1,214 @@
+# Approval-gated destroy of the platform (cluster, service accounts, role binding, API keys, environment) for one environment (TEST or PROD only, never DEV).
+# Run applications-destroy for the same environment FIRST. This removes the cluster and the environment.
+# Preview stage: plans the destroy and checks the exact 7 deletions, nothing is destroyed.
+# Destroy stage: only when enableDestroy is ticked AND confirm equals destroy-<environment>;
+# it then waits at the confluent-<environment> approval check, re-plans, re-checks, and destroys the saved plan.
+name: platform-destroy-${{ parameters.environment }}-$(Date:yyyyMMdd)$(Rev:.r)
+trigger: none
+pr: none
+
+parameters:
+  - name: environment
+    displayName: Environment to destroy
+    type: string
+    default: test
+    values: [test, prod]
+  - name: enableDestroy
+    displayName: Destroy after approval (leave unticked to preview only)
+    type: boolean
+    default: false
+  - name: confirm
+    displayName: Type destroy-<environment> to confirm (for example destroy-test)
+    type: string
+    default: ''
+
+pool:
+  vmImage: ubuntu-24.04
+
+variables:
+  terraformVersion: '1.17.1'
+  azureServiceConnection: azure-confluent-service-connection
+  keyVaultName: kv-confluent-example
+
+stages:
+  - stage: Preview
+    displayName: Preview destroy of ${{ parameters.environment }} (nothing destroyed)
+    jobs:
+      - job: PlanOnly
+        steps:
+          - checkout: self
+          - bash: |
+              set -euo pipefail
+              VERSION="$(terraformVersion)"
+              curl --fail --silent --show-error --location --retry 3 -o terraform.zip \
+                "https://releases.hashicorp.com/terraform/${VERSION}/terraform_${VERSION}_linux_amd64.zip"
+              unzip -q terraform.zip terraform
+              sudo install terraform /usr/local/bin/terraform
+              rm -f terraform.zip terraform
+              terraform fmt -check -recursive
+              terraform -chdir=environments/${{ parameters.environment }} init -backend=false -input=false -lockfile=readonly
+              terraform -chdir=environments/${{ parameters.environment }} validate -no-color
+            displayName: Install and validate Terraform
+          - task: AzureKeyVault@2
+            displayName: Retrieve credentials from Key Vault
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              KeyVaultName: $(keyVaultName)
+              SecretsFilter: confluent-cloud-api-key,confluent-cloud-api-secret
+              RunAsPreJob: false
+          - task: AzureCLI@2
+            displayName: Plan the destroy and check the exact deletions (nothing destroyed)
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              workingDirectory: $(Build.SourcesDirectory)
+              inlineScript: |
+                set -euo pipefail
+                umask 077
+                PLAN_DIR="$(mktemp -d "$(Agent.TempDirectory)/platform-destroy.XXXXXXXX")"
+                trap 'rm -rf -- "$PLAN_DIR"' EXIT
+                export ARM_USE_OIDC=true ARM_USE_AZUREAD=true ARM_USE_CLI=false
+                export ARM_CLIENT_ID="$servicePrincipalId"
+                export ARM_TENANT_ID="$tenantId"
+                export ARM_SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+                export ARM_OIDC_TOKEN="$idToken"
+                export TF_VAR_confluent_cloud_api_key="$CONFLUENT_CLOUD_API_KEY"
+                export TF_VAR_confluent_cloud_api_secret="$CONFLUENT_CLOUD_API_SECRET"
+                terraform -chdir=environments/${{ parameters.environment }} init -input=false -lockfile=readonly \
+                  -backend-config=use_cli=false -backend-config=use_oidc=true -backend-config=use_azuread_auth=true
+                terraform -chdir=environments/${{ parameters.environment }} plan -destroy -input=false -no-color -lock-timeout=5m \
+                  -var=deploy_kafka_cluster=true \
+                  -var=deploy_service_accounts=true \
+                  -var=deploy_rbac=true \
+                  -var=deploy_kafka_api_keys=true \
+                  -out="$PLAN_DIR/tfplan"
+                terraform -chdir=environments/${{ parameters.environment }} show -json "$PLAN_DIR/tfplan" > "$PLAN_DIR/plan.json"
+                export PLAN_JSON="$PLAN_DIR/plan.json"
+                export TARGET_ENV="${{ parameters.environment }}"
+                python3 - <<'PYCODE'
+                import json, os, sys
+                env = os.environ['TARGET_ENV']
+                expected = {
+                    'confluent_environment.' + env,
+                    'module.api_keys.confluent_api_key.this["application"]',
+                    'module.api_keys.confluent_api_key.this["platform"]',
+                    'module.kafka_cluster[0].confluent_kafka_cluster.this',
+                    'module.security.confluent_role_binding.this["platform_environment_admin"]',
+                    'module.service_accounts.confluent_service_account.this["application"]',
+                    'module.service_accounts.confluent_service_account.this["platform"]',
+                }
+                with open(os.environ['PLAN_JSON'], encoding='utf-8') as f:
+                    plan = json.load(f)
+                changes = {}
+                for r in plan.get('resource_changes', []):
+                    actions = r.get('change', {}).get('actions', [])
+                    if actions not in (['no-op'], ['read']):
+                        changes[r['address']] = actions
+                for address, actions in sorted(changes.items()):
+                    print(f'Planned: {address}: {actions}')
+                if set(changes) != expected or any(a != ['delete'] for a in changes.values()):
+                    print('##vso[task.logissue type=error]Blocked: expected exactly the 7 deletions listed and nothing else.')
+                    sys.exit(1)
+                print('PASS: exactly 7 deletions.')
+                PYCODE
+                echo 'No destroy executed.'
+            env:
+              CONFLUENT_CLOUD_API_KEY: $(confluent-cloud-api-key)
+              CONFLUENT_CLOUD_API_SECRET: $(confluent-cloud-api-secret)
+
+  - ${{ if and(eq(parameters.enableDestroy, true), eq(parameters.confirm, format('destroy-{0}', parameters.environment))) }}:
+      - stage: Destroy
+        displayName: Approved destroy of ${{ parameters.environment }}
+        dependsOn: Preview
+        jobs:
+          - deployment: Destroy
+            displayName: Destroy ${{ parameters.environment }} after approval
+            environment: confluent-${{ parameters.environment }}
+            strategy:
+              runOnce:
+                deploy:
+                  steps:
+                    - checkout: self
+                    - bash: |
+                        set -euo pipefail
+                        VERSION="$(terraformVersion)"
+                        curl --fail --silent --show-error --location --retry 3 -o terraform.zip \
+                          "https://releases.hashicorp.com/terraform/${VERSION}/terraform_${VERSION}_linux_amd64.zip"
+                        unzip -q terraform.zip terraform
+                        sudo install terraform /usr/local/bin/terraform
+                        rm -f terraform.zip terraform
+                        terraform fmt -check -recursive
+                        terraform -chdir=environments/${{ parameters.environment }} init -backend=false -input=false -lockfile=readonly
+                        terraform -chdir=environments/${{ parameters.environment }} validate -no-color
+                      displayName: Install Terraform and validate
+                    - task: AzureKeyVault@2
+                      displayName: Retrieve credentials from Key Vault
+                      inputs:
+                        azureSubscription: $(azureServiceConnection)
+                        KeyVaultName: $(keyVaultName)
+                        SecretsFilter: confluent-cloud-api-key,confluent-cloud-api-secret
+                        RunAsPreJob: false
+                    - task: AzureCLI@2
+                      displayName: Re-check the destroy plan and destroy
+                      inputs:
+                        azureSubscription: $(azureServiceConnection)
+                        scriptType: bash
+                        scriptLocation: inlineScript
+                        addSpnToEnvironment: true
+                        workingDirectory: $(Build.SourcesDirectory)
+                        inlineScript: |
+                          set -euo pipefail
+                          umask 077
+                          PLAN_DIR="$(mktemp -d "$(Agent.TempDirectory)/platform-destroy.XXXXXXXX")"
+                          trap 'rm -rf -- "$PLAN_DIR"' EXIT
+                          export ARM_USE_OIDC=true ARM_USE_AZUREAD=true ARM_USE_CLI=false
+                          export ARM_CLIENT_ID="$servicePrincipalId"
+                          export ARM_TENANT_ID="$tenantId"
+                          export ARM_SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+                          export ARM_OIDC_TOKEN="$idToken"
+                          export TF_VAR_confluent_cloud_api_key="$CONFLUENT_CLOUD_API_KEY"
+                          export TF_VAR_confluent_cloud_api_secret="$CONFLUENT_CLOUD_API_SECRET"
+                          terraform -chdir=environments/${{ parameters.environment }} init -input=false -lockfile=readonly \
+                            -backend-config=use_cli=false -backend-config=use_oidc=true -backend-config=use_azuread_auth=true
+                          terraform -chdir=environments/${{ parameters.environment }} plan -destroy -input=false -no-color -lock-timeout=5m \
+                            -var=deploy_kafka_cluster=true \
+                            -var=deploy_service_accounts=true \
+                            -var=deploy_rbac=true \
+                            -var=deploy_kafka_api_keys=true \
+                            -out="$PLAN_DIR/tfplan"
+                          terraform -chdir=environments/${{ parameters.environment }} show -json "$PLAN_DIR/tfplan" > "$PLAN_DIR/plan.json"
+                          export PLAN_JSON="$PLAN_DIR/plan.json"
+                          export TARGET_ENV="${{ parameters.environment }}"
+                          python3 - <<'PYCODE'
+                          import json, os, sys
+                          env = os.environ['TARGET_ENV']
+                          expected = {
+                              'confluent_environment.' + env,
+                              'module.api_keys.confluent_api_key.this["application"]',
+                              'module.api_keys.confluent_api_key.this["platform"]',
+                              'module.kafka_cluster[0].confluent_kafka_cluster.this',
+                              'module.security.confluent_role_binding.this["platform_environment_admin"]',
+                              'module.service_accounts.confluent_service_account.this["application"]',
+                              'module.service_accounts.confluent_service_account.this["platform"]',
+                          }
+                          with open(os.environ['PLAN_JSON'], encoding='utf-8') as f:
+                              plan = json.load(f)
+                          changes = {}
+                          for r in plan.get('resource_changes', []):
+                              actions = r.get('change', {}).get('actions', [])
+                              if actions not in (['no-op'], ['read']):
+                                  changes[r['address']] = actions
+                          for address, actions in sorted(changes.items()):
+                              print(f'Planned: {address}: {actions}')
+                          if set(changes) != expected or any(a != ['delete'] for a in changes.values()):
+                              print('##vso[task.logissue type=error]Blocked: expected exactly the 7 deletions listed and nothing else.')
+                              sys.exit(1)
+                          print('PASS: exactly 7 deletions.')
+                          PYCODE
+                          terraform -chdir=environments/${{ parameters.environment }} apply -input=false -no-color "$PLAN_DIR/tfplan"
+                          echo 'PASS: approved destroy finished.'
+                      env:
+                        CONFLUENT_CLOUD_API_KEY: $(confluent-cloud-api-key)
+                        CONFLUENT_CLOUD_API_SECRET: $(confluent-cloud-api-secret)

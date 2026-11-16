@@ -1,0 +1,52 @@
+# Validate DEV, TEST and PROD without contacting remote Terraform state.
+name: confluent-applications-ci-$(Date:yyyyMMdd)$(Rev:.r)
+trigger:
+  branches:
+    include: [main]
+  paths:
+    include: [environments/**, modules/**, pipelines/**]
+pr:
+  branches:
+    include: [main]
+pool:
+  vmImage: ubuntu-24.04
+variables:
+  terraformVersion: '1.17.1'
+stages:
+  - stage: Validate
+    displayName: Validate all three environments (no Apply)
+    jobs:
+      - job: Terraform
+        displayName: Terraform static validation
+        steps:
+          - checkout: self
+          - bash: |
+              set -euo pipefail
+              VERSION="$(terraformVersion)"
+              curl --fail --silent --show-error --location --retry 3 \
+                -o terraform.zip \
+                "https://releases.hashicorp.com/terraform/${VERSION}/terraform_${VERSION}_linux_amd64.zip"
+              unzip -q terraform.zip terraform
+              sudo install terraform /usr/local/bin/terraform
+              rm -f terraform.zip terraform
+              terraform version
+            displayName: Install Terraform
+          - bash: |
+              set -euo pipefail
+              terraform fmt -check -recursive
+              for env in dev test prod; do
+                echo "Validating $env (backend disabled; no infrastructure changes)"
+                terraform -chdir="environments/$env" init -backend=false -input=false -lockfile=readonly
+                terraform -chdir="environments/$env" validate -no-color
+              done
+              echo 'All environments validated. No Terraform Apply executed.'
+            displayName: Validate DEV TEST PROD
+
+          - bash: |
+              set -euo pipefail
+              python3 -m json.tool schemas/orders-value.avsc > /dev/null
+              test -f environments/dev/schemas.tf
+              test -f environments/dev/schema-variables.tf
+              grep -q 'resource "confluent_schema"' environments/dev/schemas.tf
+              echo "DEV Schema Registry configuration checks passed."
+            displayName: Validate DEV Schema Registry files

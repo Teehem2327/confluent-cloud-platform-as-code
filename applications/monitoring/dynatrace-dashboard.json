@@ -1,0 +1,287 @@
+{
+  "version": 21,
+  "variables": [],
+  "tiles": {
+    "00000000-0000-0000-0000-000000000000": {
+      "title": "Bytes received (producers \u2192 broker)",
+      "type": "data",
+      "query": "timeseries received_bytes = avg(custom.confluent.dev.received_bytes), by:{environment,cluster}",
+      "visualization": "lineChart",
+      "querySettings": {
+        "defaultSamplingRatio": 10,
+        "defaultScanLimitGbytes": 500,
+        "enableSampling": false,
+        "maxResultMegaBytes": 1,
+        "maxResultRecords": 1000
+      },
+      "davis": {
+        "davisVisualization": {
+          "isAvailable": true
+        },
+        "enabled": false
+      }
+    },
+    "00000000-0000-0000-0000-000000000000": {
+      "title": "Bytes sent (broker \u2192 consumers)",
+      "type": "data",
+      "query": "timeseries sent_bytes = avg(custom.confluent.dev.sent_bytes), by:{environment,cluster}",
+      "visualization": "lineChart",
+      "querySettings": {
+        "defaultSamplingRatio": 10,
+        "defaultScanLimitGbytes": 500,
+        "enableSampling": false,
+        "maxResultMegaBytes": 1,
+        "maxResultRecords": 1000
+      },
+      "davis": {
+        "davisVisualization": {
+          "isAvailable": true
+        },
+        "enabled": false
+      }
+    },
+    "00000000-0000-0000-0000-000000000000": {
+      "title": "Consumer lag (offsets) by group and topic",
+      "type": "data",
+      "query": "timeseries lag = max(custom.confluent.dev.consumer_lag_offsets), by:{environment,consumer_group,topic}",
+      "visualization": "lineChart",
+      "querySettings": {
+        "defaultSamplingRatio": 10,
+        "defaultScanLimitGbytes": 500,
+        "enableSampling": false,
+        "maxResultMegaBytes": 1,
+        "maxResultRecords": 1000
+      },
+      "davis": {
+        "davisVisualization": {
+          "isAvailable": true
+        },
+        "enabled": false
+      }
+    },
+    "00000000-0000-0000-0000-000000000000": {
+      "title": "Active connections",
+      "type": "data",
+      "query": "timeseries connections = avg(custom.confluent.dev.active_connections), by:{environment,cluster}",
+      "visualization": "lineChart",
+      "querySettings": {
+        "defaultSamplingRatio": 10,
+        "defaultScanLimitGbytes": 500,
+        "enableSampling": false,
+        "maxResultMegaBytes": 1,
+        "maxResultRecords": 1000
+      },
+      "davis": {
+        "davisVisualization": {
+          "isAvailable": true
+        },
+        "enabled": false
+      }
+    },
+    "00000000-0000-0000-0000-000000000000": {
+      "title": "Retained bytes by topic (storage used)",
+      "type": "data",
+      "query": "timeseries retained = max(custom.confluent.dev.retained_bytes), by:{environment,topic}",
+      "visualization": "lineChart",
+      "querySettings": {
+        "defaultSamplingRatio": 10,
+        "defaultScanLimitGbytes": 500,
+        "enableSampling": false,
+        "maxResultMegaBytes": 1,
+        "maxResultRecords": 1000
+      },
+      "davis": {
+        "davisVisualization": {
+          "isAvailable": true
+        },
+        "enabled": false
+      }
+    },
+    "00000000-0000-0000-0000-000000000000": {
+      "title": "DEV: throughput in vs out",
+      "type": "data",
+      "query": "timeseries { received = avg(custom.confluent.dev.received_bytes), sent = avg(custom.confluent.dev.sent_bytes) }, filter: { environment == \"dev\" }",
+      "visualization": "lineChart",
+      "querySettings": {
+        "defaultSamplingRatio": 10,
+        "defaultScanLimitGbytes": 500,
+        "enableSampling": false,
+        "maxResultMegaBytes": 1,
+        "maxResultRecords": 1000
+      },
+      "davis": {
+        "davisVisualization": {
+          "isAvailable": true
+        },
+        "enabled": false
+      }
+    },
+    "00000000-0000-0000-0000-000000000000": {
+      "title": "DEV: retained bytes by topic",
+      "type": "data",
+      "query": "timeseries retained = max(custom.confluent.dev.retained_bytes), by:{topic}, filter: { environment == \"dev\" }",
+      "visualization": "lineChart",
+      "querySettings": {
+        "defaultSamplingRatio": 10,
+        "defaultScanLimitGbytes": 500,
+        "enableSampling": false,
+        "maxResultMegaBytes": 1,
+        "maxResultRecords": 1000
+      },
+      "davis": {
+        "davisVisualization": {
+          "isAvailable": true
+        },
+        "enabled": false
+      }
+    },
+    "00000000-0000-0000-0000-000000000000": {
+      "title": "TEST: throughput in vs out",
+      "type": "data",
+      "query": "timeseries { received = avg(custom.confluent.dev.received_bytes), sent = avg(custom.confluent.dev.sent_bytes) }, filter: { environment == \"test\" }",
+      "visualization": "lineChart",
+      "querySettings": {
+        "defaultSamplingRatio": 10,
+        "defaultScanLimitGbytes": 500,
+        "enableSampling": false,
+        "maxResultMegaBytes": 1,
+        "maxResultRecords": 1000
+      },
+      "davis": {
+        "davisVisualization": {
+          "isAvailable": true
+        },
+        "enabled": false
+      }
+    },
+    "00000000-0000-0000-0000-000000000000": {
+      "title": "TEST: retained bytes by topic",
+      "type": "data",
+      "query": "timeseries retained = max(custom.confluent.dev.retained_bytes), by:{topic}, filter: { environment == \"test\" }",
+      "visualization": "lineChart",
+      "querySettings": {
+        "defaultSamplingRatio": 10,
+        "defaultScanLimitGbytes": 500,
+        "enableSampling": false,
+        "maxResultMegaBytes": 1,
+        "maxResultRecords": 1000
+      },
+      "davis": {
+        "davisVisualization": {
+          "isAvailable": true
+        },
+        "enabled": false
+      }
+    },
+    "00000000-0000-0000-0000-000000000000": {
+      "title": "PROD: throughput in vs out",
+      "type": "data",
+      "query": "timeseries { received = avg(custom.confluent.dev.received_bytes), sent = avg(custom.confluent.dev.sent_bytes) }, filter: { environment == \"prod\" }",
+      "visualization": "lineChart",
+      "querySettings": {
+        "defaultSamplingRatio": 10,
+        "defaultScanLimitGbytes": 500,
+        "enableSampling": false,
+        "maxResultMegaBytes": 1,
+        "maxResultRecords": 1000
+      },
+      "davis": {
+        "davisVisualization": {
+          "isAvailable": true
+        },
+        "enabled": false
+      }
+    },
+    "00000000-0000-0000-0000-000000000000": {
+      "title": "PROD: retained bytes by topic",
+      "type": "data",
+      "query": "timeseries retained = max(custom.confluent.dev.retained_bytes), by:{topic}, filter: { environment == \"prod\" }",
+      "visualization": "lineChart",
+      "querySettings": {
+        "defaultSamplingRatio": 10,
+        "defaultScanLimitGbytes": 500,
+        "enableSampling": false,
+        "maxResultMegaBytes": 1,
+        "maxResultRecords": 1000
+      },
+      "davis": {
+        "davisVisualization": {
+          "isAvailable": true
+        },
+        "enabled": false
+      }
+    }
+  },
+  "layouts": {
+    "00000000-0000-0000-0000-000000000000": {
+      "x": 0,
+      "y": 0,
+      "w": 12,
+      "h": 6
+    },
+    "00000000-0000-0000-0000-000000000000": {
+      "x": 12,
+      "y": 0,
+      "w": 12,
+      "h": 6
+    },
+    "00000000-0000-0000-0000-000000000000": {
+      "x": 0,
+      "y": 6,
+      "w": 12,
+      "h": 6
+    },
+    "00000000-0000-0000-0000-000000000000": {
+      "x": 12,
+      "y": 6,
+      "w": 12,
+      "h": 6
+    },
+    "00000000-0000-0000-0000-000000000000": {
+      "x": 0,
+      "y": 12,
+      "w": 24,
+      "h": 6
+    },
+    "00000000-0000-0000-0000-000000000000": {
+      "x": 0,
+      "y": 18,
+      "w": 12,
+      "h": 6
+    },
+    "00000000-0000-0000-0000-000000000000": {
+      "x": 12,
+      "y": 18,
+      "w": 12,
+      "h": 6
+    },
+    "00000000-0000-0000-0000-000000000000": {
+      "x": 0,
+      "y": 24,
+      "w": 12,
+      "h": 6
+    },
+    "00000000-0000-0000-0000-000000000000": {
+      "x": 12,
+      "y": 24,
+      "w": 12,
+      "h": 6
+    },
+    "00000000-0000-0000-0000-000000000000": {
+      "x": 0,
+      "y": 30,
+      "w": 12,
+      "h": 6
+    },
+    "00000000-0000-0000-0000-000000000000": {
+      "x": 12,
+      "y": 30,
+      "w": 12,
+      "h": 6
+    }
+  },
+  "importedWithCode": false,
+  "annotations": [],
+  "baseQueries": [],
+  "rows": []
+}

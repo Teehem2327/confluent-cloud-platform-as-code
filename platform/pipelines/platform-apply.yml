@@ -1,0 +1,245 @@
+# Approval-gated platform deployment for one environment (TEST for now; PROD is added later on purpose).
+# Preview stage: plans and checks the exact expected creations, no approval needed, nothing applied.
+# Apply stage (only when enableApply is ticked): waits at the confluent-<environment> approval check,
+# plans again, re-checks the same exact list, applies the saved plan, then syncs the new Kafka API keys to Key Vault.
+name: platform-apply-${{ parameters.environment }}-$(Date:yyyyMMdd)$(Rev:.r)
+trigger: none
+pr: none
+
+parameters:
+  - name: environment
+    displayName: Environment to deploy
+    type: string
+    default: test
+    values: [test, prod]
+  - name: enableApply
+    displayName: Apply after approval (leave unticked to preview only)
+    type: boolean
+    default: false
+
+pool:
+  vmImage: ubuntu-24.04
+
+variables:
+  terraformVersion: '1.17.1'
+  azureServiceConnection: azure-confluent-service-connection
+  keyVaultName: kv-confluent-example
+
+stages:
+  - stage: Preview
+    displayName: Preview ${{ parameters.environment }} (no Apply)
+    jobs:
+      - job: PlanOnly
+        steps:
+          - checkout: self
+          - bash: |
+              set -euo pipefail
+              VERSION="$(terraformVersion)"
+              curl --fail --silent --show-error --location --retry 3 -o terraform.zip \
+                "https://releases.hashicorp.com/terraform/${VERSION}/terraform_${VERSION}_linux_amd64.zip"
+              unzip -q terraform.zip terraform
+              sudo install terraform /usr/local/bin/terraform
+              rm -f terraform.zip terraform
+              terraform fmt -check -recursive
+              terraform -chdir=environments/${{ parameters.environment }} init -backend=false -input=false -lockfile=readonly
+              terraform -chdir=environments/${{ parameters.environment }} validate -no-color
+            displayName: Install and validate Terraform
+          - task: AzureKeyVault@2
+            displayName: Retrieve Confluent Cloud credentials
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              KeyVaultName: $(keyVaultName)
+              SecretsFilter: confluent-cloud-api-key,confluent-cloud-api-secret
+              RunAsPreJob: false
+          - task: AzureCLI@2
+            displayName: Plan and check the exact expected creations (no Apply)
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              workingDirectory: $(Build.SourcesDirectory)
+              inlineScript: |
+                set -euo pipefail
+                umask 077
+                PLAN_DIR="$(mktemp -d "$(Agent.TempDirectory)/platform-apply-preview.XXXXXXXX")"
+                trap 'rm -rf -- "$PLAN_DIR"' EXIT
+                export PLAN_DIR
+                export ARM_USE_OIDC=true ARM_USE_AZUREAD=true ARM_USE_CLI=false
+                export ARM_CLIENT_ID="$servicePrincipalId"
+                export ARM_TENANT_ID="$tenantId"
+                export ARM_SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+                export ARM_OIDC_TOKEN="$idToken"
+                export TF_VAR_confluent_cloud_api_key="$CONFLUENT_CLOUD_API_KEY"
+                export TF_VAR_confluent_cloud_api_secret="$CONFLUENT_CLOUD_API_SECRET"
+                terraform -chdir=environments/${{ parameters.environment }} init -input=false -lockfile=readonly \
+                  -backend-config=use_cli=false -backend-config=use_oidc=true \
+                  -backend-config=use_azuread_auth=true
+                terraform -chdir=environments/${{ parameters.environment }} plan -input=false -no-color -lock-timeout=5m \
+                  -var=deploy_kafka_cluster=true \
+                  -var=deploy_service_accounts=true \
+                  -var=deploy_rbac=true \
+                  -var=deploy_kafka_api_keys=true \
+                  -out="$PLAN_DIR/tfplan"
+                terraform -chdir=environments/${{ parameters.environment }} show -json "$PLAN_DIR/tfplan" > "$PLAN_DIR/plan.json"
+                python3 - <<'PYCODE'
+                import json, os, sys
+                from collections import Counter
+                with open(os.path.join(os.environ['PLAN_DIR'], 'plan.json'), encoding='utf-8') as f:
+                    plan = json.load(f)
+                expected = {
+                    'confluent_environment': 1,
+                    'confluent_kafka_cluster': 1,
+                    'confluent_service_account': 2,
+                    'confluent_role_binding': 1,
+                    'confluent_api_key': 2,
+                }
+                counts = Counter()
+                bad = []
+                for r in plan.get('resource_changes', []):
+                    actions = r.get('change', {}).get('actions', [])
+                    if actions in (['no-op'], ['read']):
+                        continue
+                    print(f"Planned: {r['address']}: {actions}")
+                    if actions != ['create']:
+                        bad.append((r['address'], actions))
+                    counts[r['type']] += 1
+                print(f'Planned by type: {dict(counts)}')
+                if bad:
+                    print('##vso[task.logissue type=error]Blocked: only creations are permitted. Found: ' + str(bad))
+                    sys.exit(1)
+                if dict(counts) != expected:
+                    print('##vso[task.logissue type=error]Blocked: plan differs from the expected list ' + str(expected))
+                    sys.exit(1)
+                print('PASS: exactly the expected creations; nothing applied in this stage.')
+                PYCODE
+                echo 'No Terraform Apply executed.'
+            env:
+              CONFLUENT_CLOUD_API_KEY: $(confluent-cloud-api-key)
+              CONFLUENT_CLOUD_API_SECRET: $(confluent-cloud-api-secret)
+
+  - ${{ if eq(parameters.enableApply, true) }}:
+      - stage: Apply
+        displayName: Approved apply of ${{ parameters.environment }}
+        dependsOn: Preview
+        jobs:
+          - deployment: Deploy
+            displayName: Deploy ${{ parameters.environment }} after approval
+            environment: confluent-${{ parameters.environment }}
+            strategy:
+              runOnce:
+                deploy:
+                  steps:
+                    - checkout: self
+                    - bash: |
+                        set -euo pipefail
+                        VERSION="$(terraformVersion)"
+                        curl --fail --silent --show-error --location --retry 3 -o terraform.zip \
+                          "https://releases.hashicorp.com/terraform/${VERSION}/terraform_${VERSION}_linux_amd64.zip"
+                        unzip -q terraform.zip terraform
+                        sudo install terraform /usr/local/bin/terraform
+                        rm -f terraform.zip terraform
+                        terraform fmt -check -recursive
+                        terraform -chdir=environments/${{ parameters.environment }} init -backend=false -input=false -lockfile=readonly
+                        terraform -chdir=environments/${{ parameters.environment }} validate -no-color
+                      displayName: Install Terraform and validate
+                    - task: AzureKeyVault@2
+                      displayName: Retrieve Confluent Cloud credentials
+                      inputs:
+                        azureSubscription: $(azureServiceConnection)
+                        KeyVaultName: $(keyVaultName)
+                        SecretsFilter: confluent-cloud-api-key,confluent-cloud-api-secret
+                        RunAsPreJob: false
+                    - task: AzureCLI@2
+                      displayName: Re-check the plan, apply it, sync API keys to Key Vault
+                      inputs:
+                        azureSubscription: $(azureServiceConnection)
+                        scriptType: bash
+                        scriptLocation: inlineScript
+                        addSpnToEnvironment: true
+                        workingDirectory: $(Build.SourcesDirectory)
+                        inlineScript: |
+                          set -euo pipefail
+                          umask 077
+                          PLAN_DIR="$(mktemp -d "$(Agent.TempDirectory)/platform-apply.XXXXXXXX")"
+                          trap 'rm -rf -- "$PLAN_DIR"' EXIT
+                          export PLAN_DIR
+                          export TARGET_ENV="${{ parameters.environment }}"
+                          export ARM_USE_OIDC=true ARM_USE_AZUREAD=true ARM_USE_CLI=false
+                          export ARM_CLIENT_ID="$servicePrincipalId"
+                          export ARM_TENANT_ID="$tenantId"
+                          export ARM_SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+                          export ARM_OIDC_TOKEN="$idToken"
+                          export TF_VAR_confluent_cloud_api_key="$CONFLUENT_CLOUD_API_KEY"
+                          export TF_VAR_confluent_cloud_api_secret="$CONFLUENT_CLOUD_API_SECRET"
+                          terraform -chdir=environments/${{ parameters.environment }} init -input=false -lockfile=readonly \
+                            -backend-config=use_cli=false -backend-config=use_oidc=true \
+                            -backend-config=use_azuread_auth=true
+                          terraform -chdir=environments/${{ parameters.environment }} plan -input=false -no-color -lock-timeout=5m \
+                            -var=deploy_kafka_cluster=true \
+                            -var=deploy_service_accounts=true \
+                            -var=deploy_rbac=true \
+                            -var=deploy_kafka_api_keys=true \
+                            -out="$PLAN_DIR/tfplan"
+                          terraform -chdir=environments/${{ parameters.environment }} show -json "$PLAN_DIR/tfplan" > "$PLAN_DIR/plan.json"
+                          python3 - <<'PYCODE'
+                          import json, os, sys
+                          from collections import Counter
+                          with open(os.path.join(os.environ['PLAN_DIR'], 'plan.json'), encoding='utf-8') as f:
+                              plan = json.load(f)
+                          expected = {
+                              'confluent_environment': 1,
+                              'confluent_kafka_cluster': 1,
+                              'confluent_service_account': 2,
+                              'confluent_role_binding': 1,
+                              'confluent_api_key': 2,
+                          }
+                          counts = Counter()
+                          bad = []
+                          for r in plan.get('resource_changes', []):
+                              actions = r.get('change', {}).get('actions', [])
+                              if actions in (['no-op'], ['read']):
+                                  continue
+                              print(f"Planned: {r['address']}: {actions}")
+                              if actions != ['create']:
+                                  bad.append((r['address'], actions))
+                              counts[r['type']] += 1
+                          if bad or dict(counts) != expected:
+                              print('##vso[task.logissue type=error]Blocked: the plan is not exactly the expected creations.')
+                              sys.exit(1)
+                          print('PASS: exactly the expected creations; applying the saved plan.')
+                          PYCODE
+                          terraform -chdir=environments/${{ parameters.environment }} apply -input=false -no-color "$PLAN_DIR/tfplan"
+                          # Read sensitive outputs in memory; short-lived files exist only for az CLI --file and are removed.
+                          # Do not echo, trace, publish, or upload Terraform state, plan or secret files.
+                          export KEY_VAULT_NAME="$(keyVaultName)"
+                          python3 - <<'PYCODE'
+                          import json, os, pathlib, subprocess
+                          env = os.environ['TARGET_ENV']
+                          directory = pathlib.Path(os.environ['PLAN_DIR'])
+                          result = subprocess.run(
+                              ['terraform', f'-chdir=environments/{env}', 'output', '-json', f'{env}_kafka_api_key_credentials'],
+                              check=True, capture_output=True, text=True)
+                          credentials = json.loads(result.stdout)
+                          if set(credentials) != {'platform', 'application'}:
+                              raise RuntimeError('Unexpected API key output entries; Key Vault sync stopped')
+                          for role in ('platform', 'application'):
+                              for field in ('key', 'secret'):
+                                  value = credentials[role][field]
+                                  if not isinstance(value, str) or not value:
+                                      raise RuntimeError('Missing credential field; Key Vault sync stopped')
+                                  path = directory / f'{role}-{field}.txt'
+                                  path.write_text(value, encoding='utf-8')
+                                  path.chmod(0o600)
+                                  subprocess.run([
+                                      'az', 'keyvault', 'secret', 'set',
+                                      '--vault-name', os.environ['KEY_VAULT_NAME'],
+                                      '--name', f'{env}-{role}-kafka-api-{field}',
+                                      '--file', str(path), '--encoding', 'utf-8', '--output', 'none',
+                                  ], check=True)
+                                  path.unlink()
+                          print(f'PASS: four {env.upper()} Kafka credential values synchronized to Azure Key Vault (values hidden).')
+                          PYCODE
+                      env:
+                        CONFLUENT_CLOUD_API_KEY: $(confluent-cloud-api-key)
+                        CONFLUENT_CLOUD_API_SECRET: $(confluent-cloud-api-secret)

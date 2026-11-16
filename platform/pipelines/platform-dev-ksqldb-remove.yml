@@ -1,0 +1,189 @@
+# Approval-gated REMOVAL of the DEV ksqlDB cluster only. Everything else in DEV is untouched.
+# It plans with deploy_ksqldb=false and requires exactly one change: the deletion of confluent_ksql_cluster.dev[0].
+# Preview stage: plan and check only; nothing is removed.
+# Remove stage: only when enableRemove is ticked AND confirm equals remove-ksqldb;
+# it then waits at the confluent-dev approval check, re-plans, re-checks and applies the saved plan.
+name: PLATFORM-DEV-KSQLDB-REMOVE-$(Date:yyyyMMdd)$(Rev:.r)
+trigger: none
+pr: none
+
+parameters:
+  - name: enableRemove
+    displayName: REMOVE the DEV ksqlDB cluster after approval (leave unticked to preview only)
+    type: boolean
+    default: false
+  - name: confirm
+    displayName: Type remove-ksqldb to confirm
+    type: string
+    default: ''
+
+pool:
+  vmImage: ubuntu-24.04
+
+variables:
+  terraformVersion: '1.17.1'
+  azureServiceConnection: azure-confluent-service-connection
+  keyVaultName: kv-confluent-example
+
+stages:
+  - stage: Preview
+    displayName: Preview ksqlDB removal (nothing removed)
+    jobs:
+      - job: PlanOnly
+        steps:
+          - checkout: self
+          - bash: |
+              set -euo pipefail
+              VERSION="$(terraformVersion)"
+              curl --fail --silent --show-error --location --retry 3 -o terraform.zip \
+                "https://releases.hashicorp.com/terraform/${VERSION}/terraform_${VERSION}_linux_amd64.zip"
+              unzip -q terraform.zip terraform
+              sudo install terraform /usr/local/bin/terraform
+              rm -f terraform.zip terraform
+              terraform fmt -check -recursive
+              terraform -chdir=environments/dev init -backend=false -input=false -lockfile=readonly
+              terraform -chdir=environments/dev validate -no-color
+            displayName: Install and validate Terraform
+          - task: AzureKeyVault@2
+            displayName: Retrieve Confluent Cloud credentials
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              KeyVaultName: $(keyVaultName)
+              SecretsFilter: confluent-cloud-api-key,confluent-cloud-api-secret
+              RunAsPreJob: false
+          - task: AzureCLI@2
+            displayName: Plan the ksqlDB removal and check it is the only change (nothing removed)
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              workingDirectory: $(Build.SourcesDirectory)
+              inlineScript: |
+                set -euo pipefail
+                umask 077
+                PLAN_DIR="$(mktemp -d "$(Agent.TempDirectory)/ksqldb-remove.XXXXXXXX")"
+                trap 'rm -rf -- "$PLAN_DIR"' EXIT
+                export ARM_USE_OIDC=true ARM_USE_AZUREAD=true ARM_USE_CLI=false
+                export ARM_CLIENT_ID="$servicePrincipalId"
+                export ARM_TENANT_ID="$tenantId"
+                export ARM_SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+                export ARM_OIDC_TOKEN="$idToken"
+                export TF_VAR_confluent_cloud_api_key="$CONFLUENT_CLOUD_API_KEY"
+                export TF_VAR_confluent_cloud_api_secret="$CONFLUENT_CLOUD_API_SECRET"
+                terraform -chdir=environments/dev init -input=false -lockfile=readonly \
+                  -backend-config=use_cli=false -backend-config=use_oidc=true -backend-config=use_azuread_auth=true
+                terraform -chdir=environments/dev plan -input=false -no-color -lock-timeout=5m \
+                  -var=deploy_kafka_cluster=true \
+                  -var=deploy_service_accounts=true \
+                  -var=deploy_rbac=true \
+                  -var=deploy_kafka_api_keys=true \
+                  -var=deploy_ksqldb=false \
+                  -out="$PLAN_DIR/tfplan"
+                terraform -chdir=environments/dev show -json "$PLAN_DIR/tfplan" > "$PLAN_DIR/plan.json"
+                export PLAN_JSON="$PLAN_DIR/plan.json"
+                python3 - <<'PYCODE'
+                import json, os, sys
+                with open(os.environ['PLAN_JSON'], encoding='utf-8') as f:
+                    plan = json.load(f)
+                changes = {}
+                for r in plan.get('resource_changes', []):
+                    actions = r.get('change', {}).get('actions', [])
+                    if actions not in (['no-op'], ['read']):
+                        changes[r['address']] = actions
+                for address, actions in sorted(changes.items()):
+                    print(f'Planned: {address}: {actions}')
+                if changes != {'confluent_ksql_cluster.dev[0]': ['delete']}:
+                    print('##vso[task.logissue type=error]Blocked: the only permitted change is deleting confluent_ksql_cluster.dev[0] (if no ksqlDB cluster exists, there is nothing to remove).')
+                    sys.exit(1)
+                print('PASS: exactly one deletion, the DEV ksqlDB cluster.')
+                PYCODE
+                echo 'Nothing removed in this stage.'
+            env:
+              CONFLUENT_CLOUD_API_KEY: $(confluent-cloud-api-key)
+              CONFLUENT_CLOUD_API_SECRET: $(confluent-cloud-api-secret)
+
+  - ${{ if and(eq(parameters.enableRemove, true), eq(parameters.confirm, 'remove-ksqldb')) }}:
+      - stage: Remove
+        displayName: Approved removal of the DEV ksqlDB cluster
+        dependsOn: Preview
+        jobs:
+          - deployment: RemoveKsql
+            displayName: Remove DEV ksqlDB after approval
+            environment: confluent-dev
+            strategy:
+              runOnce:
+                deploy:
+                  steps:
+                    - checkout: self
+                    - bash: |
+                        set -euo pipefail
+                        VERSION="$(terraformVersion)"
+                        curl --fail --silent --show-error --location --retry 3 -o terraform.zip \
+                          "https://releases.hashicorp.com/terraform/${VERSION}/terraform_${VERSION}_linux_amd64.zip"
+                        unzip -q terraform.zip terraform
+                        sudo install terraform /usr/local/bin/terraform
+                        rm -f terraform.zip terraform
+                        terraform fmt -check -recursive
+                        terraform -chdir=environments/dev init -backend=false -input=false -lockfile=readonly
+                        terraform -chdir=environments/dev validate -no-color
+                      displayName: Install Terraform and validate
+                    - task: AzureKeyVault@2
+                      displayName: Retrieve Confluent Cloud credentials
+                      inputs:
+                        azureSubscription: $(azureServiceConnection)
+                        KeyVaultName: $(keyVaultName)
+                        SecretsFilter: confluent-cloud-api-key,confluent-cloud-api-secret
+                        RunAsPreJob: false
+                    - task: AzureCLI@2
+                      displayName: Re-check the plan and remove the ksqlDB cluster
+                      inputs:
+                        azureSubscription: $(azureServiceConnection)
+                        scriptType: bash
+                        scriptLocation: inlineScript
+                        addSpnToEnvironment: true
+                        workingDirectory: $(Build.SourcesDirectory)
+                        inlineScript: |
+                          set -euo pipefail
+                          umask 077
+                          PLAN_DIR="$(mktemp -d "$(Agent.TempDirectory)/ksqldb-remove.XXXXXXXX")"
+                          trap 'rm -rf -- "$PLAN_DIR"' EXIT
+                          export ARM_USE_OIDC=true ARM_USE_AZUREAD=true ARM_USE_CLI=false
+                          export ARM_CLIENT_ID="$servicePrincipalId"
+                          export ARM_TENANT_ID="$tenantId"
+                          export ARM_SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+                          export ARM_OIDC_TOKEN="$idToken"
+                          export TF_VAR_confluent_cloud_api_key="$CONFLUENT_CLOUD_API_KEY"
+                          export TF_VAR_confluent_cloud_api_secret="$CONFLUENT_CLOUD_API_SECRET"
+                          terraform -chdir=environments/dev init -input=false -lockfile=readonly \
+                            -backend-config=use_cli=false -backend-config=use_oidc=true -backend-config=use_azuread_auth=true
+                          terraform -chdir=environments/dev plan -input=false -no-color -lock-timeout=5m \
+                            -var=deploy_kafka_cluster=true \
+                            -var=deploy_service_accounts=true \
+                            -var=deploy_rbac=true \
+                            -var=deploy_kafka_api_keys=true \
+                            -var=deploy_ksqldb=false \
+                            -out="$PLAN_DIR/tfplan"
+                          terraform -chdir=environments/dev show -json "$PLAN_DIR/tfplan" > "$PLAN_DIR/plan.json"
+                          export PLAN_JSON="$PLAN_DIR/plan.json"
+                          python3 - <<'PYCODE'
+                          import json, os, sys
+                          with open(os.environ['PLAN_JSON'], encoding='utf-8') as f:
+                              plan = json.load(f)
+                          changes = {}
+                          for r in plan.get('resource_changes', []):
+                              actions = r.get('change', {}).get('actions', [])
+                              if actions not in (['no-op'], ['read']):
+                                  changes[r['address']] = actions
+                          for address, actions in sorted(changes.items()):
+                              print(f'Planned: {address}: {actions}')
+                          if changes != {'confluent_ksql_cluster.dev[0]': ['delete']}:
+                              print('##vso[task.logissue type=error]Blocked: the only permitted change is deleting confluent_ksql_cluster.dev[0].')
+                              sys.exit(1)
+                          print('PASS: exactly one deletion, the DEV ksqlDB cluster.')
+                          PYCODE
+                          terraform -chdir=environments/dev apply -input=false -no-color "$PLAN_DIR/tfplan"
+                          echo 'PASS: DEV ksqlDB cluster removed; hourly billing for it stops.'
+                      env:
+                        CONFLUENT_CLOUD_API_KEY: $(confluent-cloud-api-key)
+                        CONFLUENT_CLOUD_API_SECRET: $(confluent-cloud-api-secret)

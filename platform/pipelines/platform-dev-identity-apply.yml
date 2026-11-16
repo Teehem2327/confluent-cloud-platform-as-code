@@ -1,0 +1,134 @@
+# Manually triggered, DEV-only, approval-gated identity and RBAC deployment.
+# IMPORTANT: Ensure confluent-dev environment has a manual approval check before enabling Apply.
+name: confluent-dev-identity-apply-$(Date:yyyyMMdd)$(Rev:.r)
+trigger: none
+pr: none
+
+parameters:
+  - name: enableApply
+    displayName: 'I authorize creation of two DEV service accounts and one role binding'
+    type: boolean
+    default: false
+
+pool:
+  vmImage: ubuntu-24.04
+
+variables:
+  terraformVersion: '1.17.1'
+  azureServiceConnection: azure-confluent-service-connection
+  keyVaultName: kv-confluent-example
+
+stages:
+  - stage: SafetyNotice
+    displayName: Deployment authorization check
+    jobs:
+      - job: Notice
+        steps:
+          - bash: |
+              echo 'This pipeline creates two DEV service accounts and one EnvironmentAdmin binding.'
+              echo 'It never deploys TEST or PROD.'
+              echo 'The enableApply parameter must be explicitly set to true.'
+            displayName: Show deployment scope
+
+  - ${{ if eq(parameters.enableApply, true) }}:
+      - stage: ApprovedDevApply
+        displayName: Manually approved DEV identity deployment
+        dependsOn: SafetyNotice
+        jobs:
+          - deployment: ApplyDevIdentities
+            displayName: Review, approve, then deploy DEV identities
+            environment: confluent-dev
+            strategy:
+              runOnce:
+                deploy:
+                  steps:
+                    - checkout: self
+                    - bash: |
+                        set -euo pipefail
+                        VERSION="$(terraformVersion)"
+                        curl --fail --silent --show-error --location --retry 3 -o terraform.zip \
+                          "https://releases.hashicorp.com/terraform/${VERSION}/terraform_${VERSION}_linux_amd64.zip"
+                        unzip -q terraform.zip terraform
+                        sudo install terraform /usr/local/bin/terraform
+                        rm -f terraform.zip terraform
+                        terraform -chdir=environments/dev fmt -check
+                        terraform -chdir=environments/dev init -backend=false -input=false -lockfile=readonly
+                        terraform -chdir=environments/dev validate -no-color
+                      displayName: Install and validate Terraform
+                    - task: AzureKeyVault@2
+                      displayName: Retrieve Confluent Cloud credentials
+                      inputs:
+                        azureSubscription: $(azureServiceConnection)
+                        KeyVaultName: $(keyVaultName)
+                        SecretsFilter: confluent-cloud-api-key,confluent-cloud-api-secret
+                        RunAsPreJob: false
+                    - task: AzureCLI@2
+                      displayName: Verify exact DEV plan and apply only approved resource
+                      inputs:
+                        azureSubscription: $(azureServiceConnection)
+                        scriptType: bash
+                        scriptLocation: inlineScript
+                        addSpnToEnvironment: true
+                        workingDirectory: $(Build.SourcesDirectory)
+                        inlineScript: |
+                          set -euo pipefail
+                          umask 077
+                          PLAN_DIR="$(mktemp -d "$(Agent.TempDirectory)/dev-identity-apply.XXXXXXXX")"
+                          trap 'rm -rf -- "$PLAN_DIR"' EXIT
+                          export ARM_USE_OIDC=true ARM_USE_AZUREAD=true ARM_USE_CLI=false
+                          export ARM_CLIENT_ID="$servicePrincipalId"
+                          export ARM_TENANT_ID="$tenantId"
+                          export ARM_SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+                          export ARM_OIDC_TOKEN="$idToken"
+                          export TF_VAR_confluent_cloud_api_key="$CONFLUENT_CLOUD_API_KEY"
+                          export TF_VAR_confluent_cloud_api_secret="$CONFLUENT_CLOUD_API_SECRET"
+                          terraform -chdir=environments/dev init -input=false -lockfile=readonly \
+                            -backend-config=use_cli=false -backend-config=use_oidc=true \
+                            -backend-config=use_azuread_auth=true
+                          terraform -chdir=environments/dev plan -input=false -lock-timeout=5m \
+                            -var=deploy_kafka_cluster=true \
+                            -var=deploy_service_accounts=true \
+                            -var=deploy_rbac=true -out="$PLAN_DIR/tfplan"
+                          terraform -chdir=environments/dev show -json "$PLAN_DIR/tfplan" > "$PLAN_DIR/plan.json"
+                          export PLAN_JSON="$PLAN_DIR/plan.json"
+                          python3 - <<'PYCODE'
+                          import json, os, sys
+                          with open(os.environ['PLAN_JSON'], encoding='utf-8') as f:
+                              plan = json.load(f)
+                          expected = {
+                              'module.service_accounts.confluent_service_account.this["platform"]': 'confluent_service_account',
+                              'module.service_accounts.confluent_service_account.this["application"]': 'confluent_service_account',
+                              'module.security.confluent_role_binding.this["platform_environment_admin"]': 'confluent_role_binding',
+                          }
+                          changes = {
+                              r['address']: r for r in plan.get('resource_changes', [])
+                              if r.get('change', {}).get('actions', []) not in (['no-op'], ['read'])
+                          }
+                          for address, r in sorted(changes.items()):
+                              print(f"Resource change: {address}: {r['change']['actions']}")
+                          if set(changes) != set(expected) or any(
+                              r['type'] != expected[address] or r['change']['actions'] != ['create']
+                              for address, r in changes.items()
+                          ):
+                              sys.exit('BLOCKED: Expected exactly two service accounts and one role binding creation.')
+                          for key, name in {'platform': 'sa-dev-platform', 'application': 'sa-dev-application'}.items():
+                              address = f'module.service_accounts.confluent_service_account.this["{key}"]'
+                              if changes[address]['change']['after'].get('display_name') != name:
+                                  sys.exit(f'BLOCKED: Unexpected service account name: {address}')
+                          binding = changes['module.security.confluent_role_binding.this["platform_environment_admin"]']['change']['after']
+                          if binding.get('role_name') != 'EnvironmentAdmin':
+                              sys.exit('BLOCKED: Unexpected RBAC role')
+                          expected_crn = 'crn://confluent.cloud/organization='  # Prefix, full CRN checked against state below
+                          crn = binding.get('crn_pattern')
+                          if not isinstance(crn, str) or not crn.startswith(expected_crn) or '/environment=env-xxxxxx' not in crn:
+                              sys.exit('BLOCKED: Role binding is not scoped to the existing DEV environment')
+                          if binding.get('principal') is not None and not str(binding['principal']).startswith('User:'):
+                              sys.exit('BLOCKED: Unexpected role binding principal')
+                          print('PASS: exactly two DEV service accounts and one EnvironmentAdmin role binding.')
+                          print('PASS: existing DEV environment and Kafka cluster are unchanged.')
+                          PYCODE
+                          terraform -chdir=environments/dev apply -input=false -auto-approve "$PLAN_DIR/tfplan"
+                          echo 'DEV identities Apply completed; verify service accounts and role binding in Confluent Cloud.'
+                      env:
+                        CONFLUENT_CLOUD_API_KEY: $(confluent-cloud-api-key)
+                        CONFLUENT_CLOUD_API_SECRET: $(confluent-cloud-api-secret)

@@ -1,0 +1,38 @@
+# Scheduled monitoring collector (DEV, TEST, PROD): reads Confluent Cloud metrics and sends them to Dynatrace.
+# Runs hourly on main with no approval gate. It only reads metrics and never changes Confluent resources.
+# To stop it (for example when the Dynatrace trial ends), disable this pipeline in Azure DevOps.
+name: applications-dev-monitoring-collector-$(Date:yyyyMMdd)$(Rev:.r)
+trigger: none
+pr: none
+
+schedules:
+  - cron: '5 * * * *'
+    displayName: Hourly metric collection
+    branches:
+      include:
+        - main
+    always: true
+
+pool:
+  vmImage: ubuntu-24.04
+
+variables:
+  azureServiceConnection: azure-confluent-service-connection
+
+steps:
+  - checkout: self
+  - bash: |
+      set -euo pipefail
+      python3 -m pip install --quiet --break-system-packages -r monitoring/requirements.txt
+      python3 -m unittest discover -s monitoring -p test_collector.py
+    displayName: Install dependencies and run collector tests
+  - task: AzureCLI@2
+    displayName: Collect metrics for all enabled environments and send to Dynatrace
+    inputs:
+      azureSubscription: $(azureServiceConnection)
+      scriptType: bash
+      scriptLocation: inlineScript
+      workingDirectory: $(Build.SourcesDirectory)
+      inlineScript: |
+        set -euo pipefail
+        python3 monitoring/confluent_dynatrace_multi.py --once

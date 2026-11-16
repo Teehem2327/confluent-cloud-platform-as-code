@@ -1,0 +1,78 @@
+# DEV-only application resources preview; no Apply.
+name: applications-dev-drift-check-$(Date:yyyyMMdd)$(Rev:.r)
+trigger: none
+pr: none
+pool:
+  vmImage: ubuntu-24.04
+variables:
+  terraformVersion: '1.17.1'
+  azureServiceConnection: azure-confluent-service-connection
+  keyVaultName: kv-confluent-example
+stages:
+- stage: DevApplicationPreview
+  displayName: Preview DEV topics and ACLs
+  jobs:
+  - job: TerraformPlan
+    displayName: Plan six approved DEV resources
+    steps:
+    - checkout: self
+    - bash: |
+        set -euo pipefail
+        VERSION="$(terraformVersion)"
+        curl --fail --silent --show-error --location --retry 3 -o terraform.zip \
+          "https://releases.hashicorp.com/terraform/${VERSION}/terraform_${VERSION}_linux_amd64.zip"
+        unzip -q terraform.zip terraform
+        sudo install terraform /usr/local/bin/terraform
+        rm -f terraform.zip terraform
+        terraform fmt -check -recursive
+        terraform -chdir=environments/dev init -backend=false -input=false -lockfile=readonly
+        terraform -chdir=environments/dev validate -no-color
+      displayName: Install Terraform and validate
+    - task: AzureKeyVault@2
+      displayName: Retrieve DEV credentials from Key Vault
+      inputs:
+        azureSubscription: $(azureServiceConnection)
+        KeyVaultName: $(keyVaultName)
+        SecretsFilter: confluent-cloud-api-key,confluent-cloud-api-secret,dev-platform-kafka-api-key,dev-platform-kafka-api-secret,dev-schema-registry-api-key,dev-schema-registry-api-secret
+        RunAsPreJob: false
+    - task: AzureCLI@2
+      displayName: Plan and enforce exact DEV resource gate (no Apply)
+      inputs:
+        azureSubscription: $(azureServiceConnection)
+        scriptType: bash
+        scriptLocation: inlineScript
+        addSpnToEnvironment: true
+        workingDirectory: $(Build.SourcesDirectory)
+        inlineScript: |
+          set -euo pipefail
+          umask 077
+          PLAN_DIR="$(mktemp -d "$(Agent.TempDirectory)/applications-dev-preview.XXXXXXXX")"
+          trap 'rm -rf -- "$PLAN_DIR"' EXIT
+          export ARM_USE_OIDC=true ARM_USE_AZUREAD=true ARM_USE_CLI=false
+          export ARM_CLIENT_ID="$servicePrincipalId"
+          export ARM_TENANT_ID="$tenantId"
+          export ARM_SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+          export ARM_OIDC_TOKEN="$idToken"
+          export TF_VAR_confluent_cloud_api_key="$CONFLUENT_CLOUD_API_KEY"
+          export TF_VAR_confluent_cloud_api_secret="$CONFLUENT_CLOUD_API_SECRET"
+          export TF_VAR_kafka_api_key="$PLATFORM_KAFKA_API_KEY"
+          export TF_VAR_kafka_api_secret="$PLATFORM_KAFKA_API_SECRET"
+          export TF_VAR_schema_registry_api_key="$DEV_SR_API_KEY"
+          export TF_VAR_schema_registry_api_secret="$DEV_SR_API_SECRET"
+
+          terraform -chdir=environments/dev init -input=false -lockfile=readonly \
+            -backend-config=use_cli=false -backend-config=use_oidc=true \
+            -backend-config=use_azuread_auth=true
+          terraform -chdir=environments/dev plan -input=false -no-color \
+            -var=deploy_application_resources=true -var=deploy_schemas=true \
+            -out="$PLAN_DIR/tfplan"
+          terraform -chdir=environments/dev show -json "$PLAN_DIR/tfplan" > "$PLAN_DIR/plan.json"
+          export PLAN_JSON="$PLAN_DIR/plan.json"
+          python3 -c 'import json,os,sys; p=json.load(open(os.environ["PLAN_JSON"])); c=[(r["address"],r["change"]["actions"]) for r in p.get("resource_changes",[]) if r["change"]["actions"] not in (["no-op"],["read"])]; print("Changes:",c); sys.exit(1 if c else 0)'
+      env:
+        CONFLUENT_CLOUD_API_KEY: $(confluent-cloud-api-key)
+        CONFLUENT_CLOUD_API_SECRET: $(confluent-cloud-api-secret)
+        PLATFORM_KAFKA_API_KEY: $(dev-platform-kafka-api-key)
+        PLATFORM_KAFKA_API_SECRET: $(dev-platform-kafka-api-secret)
+        DEV_SR_API_KEY: $(dev-schema-registry-api-key)
+        DEV_SR_API_SECRET: $(dev-schema-registry-api-secret)

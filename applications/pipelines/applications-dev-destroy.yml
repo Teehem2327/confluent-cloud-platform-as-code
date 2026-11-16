@@ -1,0 +1,228 @@
+# *** PERMANENT DESTROY OF THE DEV APPLICATIONS ***  Removes the APPLICATIONS of DEV (topics, ACLs, orders schema, guards).
+# Run this BEFORE platform-dev-destroy (it needs the cluster and its API key).
+# Preview stage: plans the destroy and lists every deletion; nothing is destroyed.
+# Destroy stage appears only when enableDestroy is ticked, confirm equals destroy-dev,
+# and expectedDeletions equals the number of deletions shown by a Preview run.
+# It then waits at the confluent-dev approval check, re-plans, re-checks, and destroys the saved plan.
+name: APPLICATIONS-DEV-DESTROY-$(Date:yyyyMMdd)$(Rev:.r)
+trigger: none
+pr: none
+
+parameters:
+  - name: enableDestroy
+    displayName: DESTROY DEV after approval (leave unticked to preview only)
+    type: boolean
+    default: false
+  - name: confirm
+    displayName: Type destroy-dev to confirm
+    type: string
+    default: ''
+  - name: expectedDeletions
+    displayName: Number of deletions shown by the Preview run (0 = preview only)
+    type: number
+    default: 0
+
+pool:
+  vmImage: ubuntu-24.04
+
+variables:
+  terraformVersion: '1.17.1'
+  azureServiceConnection: azure-confluent-service-connection
+  keyVaultName: kv-confluent-example
+
+stages:
+  - stage: Preview
+    displayName: Preview DEV destroy (nothing destroyed)
+    jobs:
+      - job: PlanOnly
+        steps:
+          - checkout: self
+          - bash: |
+              set -euo pipefail
+              VERSION="$(terraformVersion)"
+              curl --fail --silent --show-error --location --retry 3 -o terraform.zip \
+                "https://releases.hashicorp.com/terraform/${VERSION}/terraform_${VERSION}_linux_amd64.zip"
+              unzip -q terraform.zip terraform
+              sudo install terraform /usr/local/bin/terraform
+              rm -f terraform.zip terraform
+              terraform fmt -check -recursive
+              terraform -chdir=environments/dev init -backend=false -input=false -lockfile=readonly
+              terraform -chdir=environments/dev validate -no-color
+            displayName: Install and validate Terraform
+          - task: AzureKeyVault@2
+            displayName: Retrieve credentials from Key Vault
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              KeyVaultName: $(keyVaultName)
+              SecretsFilter: confluent-cloud-api-key,confluent-cloud-api-secret,dev-platform-kafka-api-key,dev-platform-kafka-api-secret,dev-schema-registry-api-key,dev-schema-registry-api-secret
+              RunAsPreJob: false
+          - task: AzureCLI@2
+            displayName: Plan the DEV destroy and list every deletion (nothing destroyed)
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              workingDirectory: $(Build.SourcesDirectory)
+              inlineScript: |
+                set -euo pipefail
+                umask 077
+                PLAN_DIR="$(mktemp -d "$(Agent.TempDirectory)/applications-dev-destroy.XXXXXXXX")"
+                trap 'rm -rf -- "$PLAN_DIR"' EXIT
+                export ARM_USE_OIDC=true ARM_USE_AZUREAD=true ARM_USE_CLI=false
+                export ARM_CLIENT_ID="$servicePrincipalId"
+                export ARM_TENANT_ID="$tenantId"
+                export ARM_SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+                export ARM_OIDC_TOKEN="$idToken"
+                export TF_VAR_confluent_cloud_api_key="$CONFLUENT_CLOUD_API_KEY"
+                export TF_VAR_confluent_cloud_api_secret="$CONFLUENT_CLOUD_API_SECRET"
+                export TF_VAR_kafka_api_key="$PLATFORM_KAFKA_API_KEY"
+                export TF_VAR_kafka_api_secret="$PLATFORM_KAFKA_API_SECRET"
+                export TF_VAR_schema_registry_api_key="$DEV_SR_API_KEY"
+                export TF_VAR_schema_registry_api_secret="$DEV_SR_API_SECRET"
+                terraform -chdir=environments/dev init -input=false -lockfile=readonly \
+                  -backend-config=use_cli=false -backend-config=use_oidc=true -backend-config=use_azuread_auth=true
+                terraform -chdir=environments/dev plan -destroy -input=false -no-color -lock-timeout=5m \
+                  -var=deploy_application_resources=true -var=deploy_schemas=true \
+                  -out="$PLAN_DIR/tfplan"
+                terraform -chdir=environments/dev show -json "$PLAN_DIR/tfplan" > "$PLAN_DIR/plan.json"
+                export PLAN_JSON="$PLAN_DIR/plan.json"
+                export EXPECTED_DELETIONS="${{ parameters.expectedDeletions }}"
+                export REQUIRE_COUNT=false
+                python3 - <<'PYCODE'
+                import json, os, sys
+                allowed = {'confluent_kafka_topic','confluent_kafka_acl','confluent_schema','terraform_data'}
+                expected_count = int(os.environ['EXPECTED_DELETIONS'])
+                require_count = os.environ['REQUIRE_COUNT'] == 'true'
+                with open(os.environ['PLAN_JSON'], encoding='utf-8') as f:
+                    plan = json.load(f)
+                changes = {}
+                types = {}
+                for r in plan.get('resource_changes', []):
+                    actions = r.get('change', {}).get('actions', [])
+                    if actions not in (['no-op'], ['read']):
+                        changes[r['address']] = actions
+                        types[r['address']] = r['type']
+                for address, actions in sorted(changes.items()):
+                    print(f'Planned: {address}: {actions}')
+                print(f'Total deletions planned: {len(changes)}')
+                bad = [a for a, x in changes.items() if x != ['delete']]
+                unknown = [a for a, t in types.items() if t not in allowed]
+                if bad or unknown or not changes:
+                    print('##vso[task.logissue type=error]Blocked: only known DEV resource types may be deleted, nothing else may change. ' + str(bad + unknown))
+                    sys.exit(1)
+                if require_count and len(changes) != expected_count:
+                    print(f'##vso[task.logissue type=error]Blocked: plan has {len(changes)} deletions but expectedDeletions is {expected_count}.')
+                    sys.exit(1)
+                print('PASS: only deletions of known DEV resource types.')
+                PYCODE
+                echo 'No destroy executed.'
+            env:
+              CONFLUENT_CLOUD_API_KEY: $(confluent-cloud-api-key)
+              CONFLUENT_CLOUD_API_SECRET: $(confluent-cloud-api-secret)
+              PLATFORM_KAFKA_API_KEY: $(dev-platform-kafka-api-key)
+              PLATFORM_KAFKA_API_SECRET: $(dev-platform-kafka-api-secret)
+              DEV_SR_API_KEY: $(dev-schema-registry-api-key)
+              DEV_SR_API_SECRET: $(dev-schema-registry-api-secret)
+
+  - ${{ if and(eq(parameters.enableDestroy, true), eq(parameters.confirm, 'destroy-dev'), gt(parameters.expectedDeletions, 0)) }}:
+      - stage: Destroy
+        displayName: Approved DESTROY of DEV
+        dependsOn: Preview
+        jobs:
+          - deployment: DestroyDev
+            displayName: Destroy DEV after approval
+            environment: confluent-dev
+            strategy:
+              runOnce:
+                deploy:
+                  steps:
+                    - checkout: self
+                    - bash: |
+                        set -euo pipefail
+                        VERSION="$(terraformVersion)"
+                        curl --fail --silent --show-error --location --retry 3 -o terraform.zip \
+                          "https://releases.hashicorp.com/terraform/${VERSION}/terraform_${VERSION}_linux_amd64.zip"
+                        unzip -q terraform.zip terraform
+                        sudo install terraform /usr/local/bin/terraform
+                        rm -f terraform.zip terraform
+                        terraform fmt -check -recursive
+                        terraform -chdir=environments/dev init -backend=false -input=false -lockfile=readonly
+                        terraform -chdir=environments/dev validate -no-color
+                      displayName: Install Terraform and validate
+                    - task: AzureKeyVault@2
+                      displayName: Retrieve credentials from Key Vault
+                      inputs:
+                        azureSubscription: $(azureServiceConnection)
+                        KeyVaultName: $(keyVaultName)
+                        SecretsFilter: confluent-cloud-api-key,confluent-cloud-api-secret,dev-platform-kafka-api-key,dev-platform-kafka-api-secret,dev-schema-registry-api-key,dev-schema-registry-api-secret
+                        RunAsPreJob: false
+                    - task: AzureCLI@2
+                      displayName: Re-check the DEV destroy plan and destroy
+                      inputs:
+                        azureSubscription: $(azureServiceConnection)
+                        scriptType: bash
+                        scriptLocation: inlineScript
+                        addSpnToEnvironment: true
+                        workingDirectory: $(Build.SourcesDirectory)
+                        inlineScript: |
+                          set -euo pipefail
+                          umask 077
+                          PLAN_DIR="$(mktemp -d "$(Agent.TempDirectory)/applications-dev-destroy.XXXXXXXX")"
+                          trap 'rm -rf -- "$PLAN_DIR"' EXIT
+                          export ARM_USE_OIDC=true ARM_USE_AZUREAD=true ARM_USE_CLI=false
+                          export ARM_CLIENT_ID="$servicePrincipalId"
+                          export ARM_TENANT_ID="$tenantId"
+                          export ARM_SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+                          export ARM_OIDC_TOKEN="$idToken"
+                          export TF_VAR_confluent_cloud_api_key="$CONFLUENT_CLOUD_API_KEY"
+                          export TF_VAR_confluent_cloud_api_secret="$CONFLUENT_CLOUD_API_SECRET"
+                          export TF_VAR_kafka_api_key="$PLATFORM_KAFKA_API_KEY"
+                          export TF_VAR_kafka_api_secret="$PLATFORM_KAFKA_API_SECRET"
+                          export TF_VAR_schema_registry_api_key="$DEV_SR_API_KEY"
+                          export TF_VAR_schema_registry_api_secret="$DEV_SR_API_SECRET"
+                          terraform -chdir=environments/dev init -input=false -lockfile=readonly \
+                            -backend-config=use_cli=false -backend-config=use_oidc=true -backend-config=use_azuread_auth=true
+                          terraform -chdir=environments/dev plan -destroy -input=false -no-color -lock-timeout=5m \
+                            -var=deploy_application_resources=true -var=deploy_schemas=true \
+                            -out="$PLAN_DIR/tfplan"
+                          terraform -chdir=environments/dev show -json "$PLAN_DIR/tfplan" > "$PLAN_DIR/plan.json"
+                          export PLAN_JSON="$PLAN_DIR/plan.json"
+                          export EXPECTED_DELETIONS="${{ parameters.expectedDeletions }}"
+                          export REQUIRE_COUNT=true
+                          python3 - <<'PYCODE'
+                          import json, os, sys
+                          allowed = {'confluent_kafka_topic','confluent_kafka_acl','confluent_schema','terraform_data'}
+                          expected_count = int(os.environ['EXPECTED_DELETIONS'])
+                          require_count = os.environ['REQUIRE_COUNT'] == 'true'
+                          with open(os.environ['PLAN_JSON'], encoding='utf-8') as f:
+                              plan = json.load(f)
+                          changes = {}
+                          types = {}
+                          for r in plan.get('resource_changes', []):
+                              actions = r.get('change', {}).get('actions', [])
+                              if actions not in (['no-op'], ['read']):
+                                  changes[r['address']] = actions
+                                  types[r['address']] = r['type']
+                          for address, actions in sorted(changes.items()):
+                              print(f'Planned: {address}: {actions}')
+                          print(f'Total deletions planned: {len(changes)}')
+                          bad = [a for a, x in changes.items() if x != ['delete']]
+                          unknown = [a for a, t in types.items() if t not in allowed]
+                          if bad or unknown or not changes:
+                              print('##vso[task.logissue type=error]Blocked: only known DEV resource types may be deleted, nothing else may change. ' + str(bad + unknown))
+                              sys.exit(1)
+                          if require_count and len(changes) != expected_count:
+                              print(f'##vso[task.logissue type=error]Blocked: plan has {len(changes)} deletions but expectedDeletions is {expected_count}.')
+                              sys.exit(1)
+                          print('PASS: only deletions of known DEV resource types.')
+                          PYCODE
+                          terraform -chdir=environments/dev apply -input=false -no-color "$PLAN_DIR/tfplan"
+                          echo 'PASS: approved DEV destroy finished.'
+                      env:
+                        CONFLUENT_CLOUD_API_KEY: $(confluent-cloud-api-key)
+                        CONFLUENT_CLOUD_API_SECRET: $(confluent-cloud-api-secret)
+                        PLATFORM_KAFKA_API_KEY: $(dev-platform-kafka-api-key)
+                        PLATFORM_KAFKA_API_SECRET: $(dev-platform-kafka-api-secret)
+                        DEV_SR_API_KEY: $(dev-schema-registry-api-key)
+                        DEV_SR_API_SECRET: $(dev-schema-registry-api-secret)

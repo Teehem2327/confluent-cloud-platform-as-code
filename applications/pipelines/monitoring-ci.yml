@@ -1,0 +1,64 @@
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - monitoring/**
+      - pipelines/monitoring-ci.yml
+
+pr:
+  branches:
+    include:
+      - main
+
+pool:
+  vmImage: ubuntu-latest
+
+steps:
+  - checkout: self
+
+  - task: UsePythonVersion@0
+    displayName: "Use Python 3.12"
+    inputs:
+      versionSpec: "3.12"
+
+  - script: |
+      python -m pip install --upgrade pip
+      python -m pip install -r monitoring/requirements.txt
+    displayName: "Install monitoring dependencies"
+
+  - script: |
+      python -m py_compile monitoring/confluent_dynatrace_multi.py
+      python -m json.tool monitoring/collector-config.json > /dev/null
+    displayName: "Validate Python and JSON"
+
+  - script: |
+      python - <<'PY'
+      import json
+      from pathlib import Path
+
+      config = json.loads(
+          Path("monitoring/collector-config.json").read_text()
+      )
+
+      assert config["poll_interval_seconds"] >= 60
+      assert config["environments"]
+      assert any(
+          env["name"] == "dev" and env["enabled"]
+          for env in config["environments"]
+      )
+      assert all(
+          not env["enabled"]
+          for env in config["environments"]
+          if env["name"] in ("test", "prod")
+      )
+
+      print("Monitoring configuration validation passed")
+      PY
+    displayName: "Validate environment configuration"
+
+  - script: |
+      python -m unittest discover -s monitoring -p "test_collector.py" -v
+    displayName: "Run monitoring collector unit tests"

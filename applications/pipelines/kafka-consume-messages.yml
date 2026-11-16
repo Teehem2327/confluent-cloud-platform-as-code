@@ -1,0 +1,120 @@
+# Manual pipeline: reads up to N messages from <environment>.orders as the group <environment>.orders-consumers
+# and commits the offsets. Consuming fewer messages than were produced leaves a measurable consumer lag.
+# Cluster and bootstrap endpoint are discovered through the Confluent Cloud API by environment name.
+# It reads and commits offsets only and never changes Terraform-managed resources.
+name: kafka-consume-messages-${{ parameters.environment }}-$(Date:yyyyMMdd)$(Rev:.r)
+trigger: none
+pr: none
+
+parameters:
+  - name: environment
+    displayName: Environment to consume from
+    type: string
+    default: test
+    values: [dev, test, prod]
+  - name: maxMessages
+    displayName: Maximum messages to consume (1-500)
+    type: number
+    default: 30
+
+pool:
+  vmImage: ubuntu-24.04
+
+variables:
+  azureServiceConnection: azure-confluent-service-connection
+  keyVaultName: kv-confluent-example
+
+steps:
+  - task: AzureKeyVault@2
+    displayName: Retrieve credentials from Key Vault
+    inputs:
+      azureSubscription: $(azureServiceConnection)
+      KeyVaultName: $(keyVaultName)
+      SecretsFilter: confluent-cloud-api-key,confluent-cloud-api-secret,${{ parameters.environment }}-application-kafka-api-key,${{ parameters.environment }}-application-kafka-api-secret
+      RunAsPreJob: false
+  - bash: |
+      set -euo pipefail
+      python3 -m pip install --quiet --break-system-packages confluent-kafka==2.6.1
+    displayName: Install the Kafka client
+  - bash: |
+      set -euo pipefail
+      python3 - <<'PYCODE'
+      import base64, json, os, sys, time, urllib.request
+      from confluent_kafka import Consumer, TopicPartition
+
+      env = os.environ['TARGET_ENV']
+      limit = int(float(os.environ['MAX_MESSAGES']))
+      if not 1 <= limit <= 500:
+          sys.exit('maxMessages must be between 1 and 500')
+
+      def basic(key, secret):
+          return 'Basic ' + base64.b64encode(f'{key}:{secret}'.encode()).decode()
+
+      def get(url, auth):
+          req = urllib.request.Request(url, headers={'Authorization': auth})
+          with urllib.request.urlopen(req, timeout=30) as resp:
+              return json.loads(resp.read().decode())
+
+      cloud = basic(os.environ['CLOUD_KEY'], os.environ['CLOUD_SECRET'])
+      envs = get('https://api.confluent.cloud/org/v2/environments?page_size=100', cloud)['data']
+      env_id = next((e['id'] for e in envs if e['display_name'] == env), None)
+      if not env_id:
+          sys.exit(f'Environment {env} not found')
+      clusters = get(f'https://api.confluent.cloud/cmk/v2/clusters?environment={env_id}&page_size=100', cloud)['data']
+      cluster = next((c for c in clusters if c['spec']['display_name'] == f'kafka-{env}'), None)
+      if not cluster:
+          sys.exit(f'Cluster kafka-{env} not found')
+      bootstrap = cluster['spec']['kafka_bootstrap_endpoint'].split('://')[-1]
+      print(f"Using {env} / {cluster['id']}")
+
+      topic = f'{env}.orders'
+      group = f'{env}.orders-consumers'
+      consumer = Consumer({
+          'bootstrap.servers': bootstrap,
+          'security.protocol': 'SASL_SSL',
+          'sasl.mechanisms': 'PLAIN',
+          'sasl.username': os.environ['APP_KEY'],
+          'sasl.password': os.environ['APP_SECRET'],
+          'group.id': group,
+          'auto.offset.reset': 'earliest',
+          'enable.auto.commit': False,
+      })
+      consumer.subscribe([topic])
+      received = 0
+      deadline = time.time() + 90
+      last = {}
+      while received < limit and time.time() < deadline:
+          msg = consumer.poll(2.0)
+          if msg is None:
+              continue
+          if msg.error():
+              print('##vso[task.logissue type=warning]Consumer event: ' + str(msg.error()))
+              continue
+          received += 1
+          last[msg.partition()] = msg.offset() + 1
+      if last:
+          consumer.commit(offsets=[TopicPartition(topic, p, o) for p, o in last.items()], asynchronous=False)
+      print(f'Consumed {received} message(s) from {topic} as group {group}.')
+      total_lag = 0
+      for p in sorted(consumer.list_topics(topic, timeout=30).topics[topic].partitions):
+          low, high = consumer.get_watermark_offsets(TopicPartition(topic, p), timeout=30)
+          committed = consumer.committed([TopicPartition(topic, p)], timeout=30)[0].offset
+          committed = committed if committed >= 0 else low
+          lag = max(high - committed, 0)
+          total_lag += lag
+          print(f'  partition {p}: end offset {high}, committed {committed}, lag {lag}')
+      print(f'Total lag for {group}: {total_lag}')
+      consumer.close()
+      if received == 0:
+          print('##vso[task.logissue type=error]No messages consumed (nothing left to read, or a permission problem).')
+          sys.exit(1)
+      print('PASS: messages consumed and offsets committed.')
+      PYCODE
+    displayName: Consume messages from ${{ parameters.environment }}.orders
+    env:
+      TARGET_ENV: ${{ parameters.environment }}
+      MAX_MESSAGES: ${{ parameters.maxMessages }}
+      CLOUD_KEY: $(confluent-cloud-api-key)
+      CLOUD_SECRET: $(confluent-cloud-api-secret)
+      APP_KEY: $(${{ parameters.environment }}-application-kafka-api-key)
+      APP_SECRET: $(${{ parameters.environment }}-application-kafka-api-secret)

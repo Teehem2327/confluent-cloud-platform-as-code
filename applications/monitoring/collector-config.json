@@ -1,0 +1,73 @@
+{
+  "poll_interval_seconds": 60,
+  "lookback_minutes": 80,
+  "confluent_metrics_url": "https://api.telemetry.confluent.cloud/v2/metrics/cloud/query",
+  "metrics": [
+    {
+      "name": "received_bytes",
+      "metric": "io.confluent.kafka.server/received_bytes",
+      "dynatrace_key": "custom.confluent.dev.received_bytes",
+      "agg": "SUM",
+      "group_by": {}
+    },
+    {
+      "name": "sent_bytes",
+      "metric": "io.confluent.kafka.server/sent_bytes",
+      "dynatrace_key": "custom.confluent.dev.sent_bytes",
+      "agg": "SUM",
+      "group_by": {}
+    },
+    {
+      "name": "retained_bytes",
+      "metric": "io.confluent.kafka.server/retained_bytes",
+      "dynatrace_key": "custom.confluent.dev.retained_bytes",
+      "agg": "SUM",
+      "group_by": {
+        "metric.topic": "topic"
+      }
+    },
+    {
+      "name": "active_connections",
+      "metric": "io.confluent.kafka.server/active_connection_count",
+      "dynatrace_key": "custom.confluent.dev.active_connections",
+      "agg": "SUM",
+      "group_by": {}
+    },
+    {
+      "name": "consumer_lag",
+      "metric": "io.confluent.kafka.server/consumer_lag_offsets",
+      "dynatrace_key": "custom.confluent.dev.consumer_lag_offsets",
+      "agg": "SUM",
+      "group_by": {
+        "metric.consumer_group_id": "consumer_group",
+        "metric.topic": "topic"
+      }
+    }
+  ],
+  "environments": [
+    {
+      "name": "dev",
+      "enabled": true,
+      "cluster_id": "lkc-xxxxxx",
+      "cluster_name": "kafka-dev",
+      "api_key_env": "CC_DEV_METRICS_KEY",
+      "api_secret_env": "CC_DEV_METRICS_SECRET"
+    },
+    {
+      "name": "test",
+      "enabled": true,
+      "cluster_id": "lkc-xxxxxx",
+      "cluster_name": "kafka-test",
+      "api_key_env": "CC_TEST_METRICS_KEY",
+      "api_secret_env": "CC_TEST_METRICS_SECRET"
+    },
+    {
+      "name": "prod",
+      "enabled": true,
+      "cluster_id": "lkc-xxxxxx",
+      "cluster_name": "kafka-prod",
+      "api_key_env": "CC_PROD_METRICS_KEY",
+      "api_secret_env": "CC_PROD_METRICS_SECRET"
+    }
+  ]
+}
