@@ -4,6 +4,18 @@ Three Confluent Cloud environments (DEV, TEST, PROD) provisioned entirely with T
 
 > **Reference copy.** Names, IDs, tenants and endpoints in this repository are placeholders. The pipelines target Azure DevOps, so they are documentation of the design rather than something that runs from GitHub as is.
 
+## Quick start
+
+Full walkthrough with expected results: **[docs/GETTING-STARTED.md](docs/GETTING-STARTED.md)**. In short:
+
+1. Get a Confluent Cloud account with a Cloud API key, plus an Azure subscription and an Azure DevOps organization and project.
+2. Create an Azure storage account (container `tfstate`) and a Key Vault, and store the Confluent API key and secret in the vault.
+3. Create an Azure DevOps service connection that uses OIDC (workload identity federation) and give it access to both.
+4. Import `platform/` and `applications/` as two Azure DevOps repos and replace the placeholders.
+5. Create the `confluent-dev`, `confluent-test` and `confluent-prod` environments, each with an approval check.
+6. Register the YAML pipelines. For TEST or PROD run `platform-apply` then `applications-apply`. DEV is built in stages with its own pipelines, listed in the guide.
+7. Test with `kafka-produce-messages` and `kafka-consume-messages`, and tear down with the destroy pipelines when you finish.
+
 ## What this demonstrates
 
 - **Infrastructure as code with no manual creation.** Every environment, cluster, service account, role binding, API key, topic and ACL is Terraform (`confluentinc/confluent` and `azurerm` providers, Terraform 1.17.x), with remote state in Azure Blob Storage.
@@ -15,7 +27,7 @@ Three Confluent Cloud environments (DEV, TEST, PROD) provisioned entirely with T
 ## Architecture
 
 ```mermaid
-flowchart LR
+flowchart TD
   E["Engineer"] -->|"pull request"| R["Azure DevOps Repos<br/>platform + applications"]
   R --> P["Preview stage<br/>terraform plan + Python gate"]
   P --> A["Approval check<br/>on the environment"]
